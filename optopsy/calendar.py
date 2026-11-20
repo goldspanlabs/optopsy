@@ -338,11 +338,11 @@ def _calculate_calendar_pnl(
     net_pnl = merged["total_exit_proceeds"] - merged["total_entry_cost"]
 
     if commission is not None:
-        from .pricing import _calculate_commission
+        from .pricing import _SHARES_PER_CONTRACT, _calculate_commission
 
         comm_per_side = _calculate_commission(leg_def, commission)
         merged["total_commission"] = comm_per_side * 2
-        net_pnl = net_pnl - merged["total_commission"]
+        net_pnl = net_pnl - merged["total_commission"] / _SHARES_PER_CONTRACT
 
     # Calculate percentage change.
     # Use a minimum threshold to avoid misleading percentages from near-zero entries.

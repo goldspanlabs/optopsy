@@ -32,7 +32,11 @@ from ..definitions import (
 )
 from ..evaluation import _evaluate_all_options
 from ..output import _format_output
-from ..pricing import _calculate_commission, _calculate_fill_price
+from ..pricing import (
+    _SHARES_PER_CONTRACT,
+    _calculate_commission,
+    _calculate_fill_price,
+)
 from ..rules import (
     _rule_butterfly_strikes,
     _rule_expiration_ordering,
@@ -470,7 +474,7 @@ def _covered_with_stock(
             option_leg_def, commission_obj, has_stock_leg=True, num_shares=100
         )
         total_commission = comm_per_side * 2
-        net_pnl = net_pnl - total_commission
+        net_pnl = net_pnl - total_commission / _SHARES_PER_CONTRACT
 
     output = pd.DataFrame(
         {
@@ -675,7 +679,7 @@ def _collar_with_stock(
             option_leg_def, commission_obj, has_stock_leg=True, num_shares=100
         )
         total_commission = comm_per_side * 2
-        net_pnl = net_pnl - total_commission
+        net_pnl = net_pnl - total_commission / _SHARES_PER_CONTRACT
 
     output = pd.DataFrame(
         {

@@ -308,7 +308,10 @@ results = op.iron_condor(
 | `base_fee` | `float` | `0.0` | Flat fee per trade |
 | `min_fee` | `float` | `0.0` | Minimum fee per trade |
 
-When set, commission costs are subtracted from P&L in the output.
+When set, commission costs are subtracted from P&L in the output. Raw output
+reports the round-trip cost in dollars as `total_commission`; for `pct_change`
+it is converted to per-share terms (100 shares per contract) to match the
+quoted option prices.
 
 ---
 
