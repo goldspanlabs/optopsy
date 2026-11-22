@@ -11,6 +11,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+# Option quotes (and therefore entry/exit prices and P&L) are per share, while
+# commissions are dollar amounts per contract. A standard equity option
+# contract covers 100 shares, so dollar commissions are divided by this before
+# being subtracted from per-share P&L.
+_SHARES_PER_CONTRACT = 100
+
 
 def _calculate_fill_price(
     bid: pd.Series,
@@ -209,7 +215,7 @@ def _assign_profit(
     if commission is not None:
         comm_per_side = _calculate_commission(leg_def, commission)
         data["total_commission"] = comm_per_side * 2
-        net_pnl = net_pnl - data["total_commission"]
+        net_pnl = net_pnl - data["total_commission"] / _SHARES_PER_CONTRACT
 
     data["pct_change"] = np.where(
         data["total_entry_cost"].abs() > 0,

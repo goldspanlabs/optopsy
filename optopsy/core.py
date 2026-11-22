@@ -41,7 +41,12 @@ from .evaluation import _evaluate_all_options
 from .exits import _apply_early_exits
 from .filters import _apply_signal_filter, _assign_dte
 from .output import _format_calendar_output, _format_output
-from .pricing import _assign_profit, _calculate_commission, _calculate_fill_price
+from .pricing import (
+    _SHARES_PER_CONTRACT,
+    _assign_profit,
+    _calculate_commission,
+    _calculate_fill_price,
+)
 from .timestamps import normalize_dates
 
 
@@ -158,7 +163,7 @@ def _strategy_engine(
         if commission is not None:
             comm_per_side = _calculate_commission(leg_def, commission)
             data["total_commission"] = comm_per_side * 2
-            net_pnl = net_pnl - data["total_commission"]
+            net_pnl = net_pnl - data["total_commission"] / _SHARES_PER_CONTRACT
 
         data["pct_change"] = np.where(
             data["entry"].abs() > 0,

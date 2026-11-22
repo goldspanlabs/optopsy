@@ -8,6 +8,7 @@ import pytest
 
 from optopsy.pricing import _calculate_commission
 from optopsy.strategies import (
+    collar,
     covered_call,
     iron_condor,
     long_call_calendar,
@@ -370,6 +371,83 @@ class TestCoveredCommission:
         )
         if not result_default.empty:
             pd.testing.assert_frame_equal(result_default, result_none)
+
+
+def _expected_pct_change(
+    entry: float, exit_: float, total_commission: float, side: int = 1
+) -> float:
+    """Expected pct_change for per-share prices and a dollar commission."""
+    net_dollars = side * (exit_ - entry) * 100 - total_commission
+    return net_dollars / (abs(entry) * 100)
+
+
+class TestCommissionPctChangeUnits:
+    """Dollar commissions must be scaled to the per-share units of option prices."""
+
+    @pytest.mark.parametrize(
+        "strategy,side", [(long_calls, 1), (short_puts, -1)], ids=["long", "short"]
+    )
+    def test_single_leg(self, data, strategy, side):
+        result = strategy(data, raw=True, commission=0.65, **_DELTA)
+        assert len(result) == 1
+        row = result.iloc[0]
+        assert row["total_commission"] == pytest.approx(1.30)
+        expected = _expected_pct_change(row["entry"], row["exit"], 1.30, side)
+        assert row["pct_change"] == pytest.approx(expected)
+
+    def test_spread(self, data):
+        result = long_call_spread(data, raw=True, commission=0.65, **_SPREAD_DELTAS)
+        assert len(result) == 1
+        row = result.iloc[0]
+        # Debit of 1.45 ($145) closed for 2.40 ($240), minus $2.60 commission.
+        assert row["total_entry_cost"] == pytest.approx(1.45)
+        assert row["total_exit_proceeds"] == pytest.approx(2.40)
+        assert row["pct_change"] == pytest.approx((240 - 145 - 2.60) / 145)
+
+    def test_calendar(self, calendar_data):
+        delta = dict(leg1_delta=TargetRange(target=0.50, min=0.35, max=0.65))
+        result = long_call_calendar(calendar_data, raw=True, commission=0.65, **delta)
+        assert len(result) == 1
+        row = result.iloc[0]
+        expected = _expected_pct_change(
+            row["total_entry_cost"], row["total_exit_proceeds"], 2.60
+        )
+        assert row["pct_change"] == pytest.approx(expected)
+
+    def test_covered_call_with_stock(self, data, stock_data):
+        comm = Commission(per_contract=0.65, per_share=0.005)
+        result = covered_call(
+            data,
+            stock_data=stock_data,
+            raw=True,
+            commission=comm,
+            leg2_delta=TargetRange(target=0.30, min=0.20, max=0.40),
+        )
+        assert len(result) == 1
+        row = result.iloc[0]
+        expected = _expected_pct_change(
+            row["total_entry_cost"], row["total_exit_proceeds"], 2.30
+        )
+        assert row["pct_change"] == pytest.approx(expected)
+
+    def test_collar_with_stock(self, data, stock_data):
+        comm = Commission(per_contract=0.65, per_share=0.005)
+        result = collar(
+            data,
+            stock_data=stock_data,
+            raw=True,
+            commission=comm,
+            leg2_delta=TargetRange(target=0.30, min=0.20, max=0.40),
+            leg3_delta=TargetRange(target=0.30, min=0.20, max=0.40),
+        )
+        assert len(result) == 1
+        row = result.iloc[0]
+        # (0.65 * 2 contracts + 0.005 * 100 shares) * 2 sides = 3.60
+        assert row["total_commission"] == pytest.approx(3.60)
+        expected = _expected_pct_change(
+            row["total_entry_cost"], row["total_exit_proceeds"], 3.60
+        )
+        assert row["pct_change"] == pytest.approx(expected)
 
 
 class TestBackwardCompatibility:
