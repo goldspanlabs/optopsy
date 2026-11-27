@@ -368,6 +368,8 @@ def _normalise_calendar(raw: pd.DataFrame) -> pd.DataFrame:
 def _select_one(candidates: pd.DataFrame, idx: Any) -> pd.Series:
     """Return a single row from *candidates* at the given index label."""
     result = candidates.loc[idx]
+    if isinstance(result, pd.DataFrame):
+        return result.iloc[0]
     assert isinstance(result, pd.Series)
     return result
 
@@ -852,7 +854,7 @@ def simulate(
             summary=_compute_summary(empty_log, capital),
         )
 
-    raw = _adjust_candidate_returns(raw.copy(), quantity * multiplier)
+    raw = _adjust_candidate_returns(raw.reset_index(drop=True), quantity * multiplier)
 
     # Select one trade per entry date (on raw data so OTM% columns are
     # available to selectors)

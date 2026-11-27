@@ -65,9 +65,10 @@ def _get_exits(
         return candidates.drop_duplicates(subset=dedup_cols, keep="first")
 
     # For each contract, pick the row with DTE closest to exit_dte.
-    # Sort deterministically by (dte, quote_date) so equidistant ties always
-    # break the same way regardless of input row order.
-    candidates = candidates.copy()
+    # Reset index so duplicate input index labels cannot cause .loc[idx] to
+    # return multiple rows, and sort deterministically by (dte, quote_date) so
+    # equidistant ties always break the same way regardless of input row order.
+    candidates = candidates.reset_index(drop=True)
     candidates["_dte_diff"] = (candidates["dte"] - exit_dte).abs()
     sort_cols = ["dte"] + (["quote_date"] if "quote_date" in candidates.columns else [])
     candidates = candidates.sort_values(sort_cols, kind="mergesort")
@@ -82,6 +83,9 @@ def _match_entries_exits(
     """Match filtered entries with exit rows, compute midpoint prices, and select output columns."""
     entry_dates = kwargs.get("entry_dates")
     exit_dates = kwargs.get("exit_dates")
+    exit_dte = kwargs["exit_dte"]
+    exit_dte_tolerance = kwargs.get("exit_dte_tolerance", 0)
+    select_closest_exit = kwargs.get("select_closest_exit", True)
 
     if entry_dates is not None:
         entries = _apply_signal_filter(entries, entry_dates)
@@ -93,11 +97,15 @@ def _match_entries_exits(
     if exit_dates is not None:
         exit_candidates = _apply_signal_filter(exit_candidates, exit_dates)
 
+    # When exit_dte_tolerance > 0, retain all eligible exit candidates during
+    # the merge so _remove_invalid_evaluated_options (dte_exit < dte_entry)
+    # runs BEFORE selecting the closest exit per entry. Otherwise a globally
+    # closer exit at dte_exit >= dte_entry would shadow a valid post-entry exit.
     exits = _get_exits(
         exit_candidates,
-        kwargs["exit_dte"],
-        kwargs.get("exit_dte_tolerance", 0),
-        select_closest=kwargs.get("select_closest_exit", True),
+        exit_dte,
+        exit_dte_tolerance,
+        select_closest=False if exit_dte_tolerance > 0 else select_closest_exit,
     )
 
     merge_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
@@ -115,6 +123,18 @@ def _match_entries_exits(
         )
         .pipe(_remove_invalid_evaluated_options)
     )
+
+    if select_closest_exit and exit_dte_tolerance > 0 and not result.empty:
+        entry_key_cols = merge_cols + ["dte_entry"]
+        sort_cols = ["_dte_diff", "dte_exit"] + (
+            ["quote_date_exit"] if "quote_date_exit" in result.columns else []
+        )
+        result = (
+            result.assign(_dte_diff=(result["dte_exit"] - exit_dte).abs())
+            .sort_values(sort_cols, kind="mergesort")
+            .drop_duplicates(subset=entry_key_cols, keep="first")
+            .drop(columns=["_dte_diff"])
+        )
 
     # Build output columns, including only those present in the result
     output_cols = [c for c in evaluated_cols if c in result.columns]

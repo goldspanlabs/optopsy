@@ -10,7 +10,6 @@ calendar-specific P&L calculation.
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 from .filters import (
@@ -209,87 +208,84 @@ def _find_calendar_exit_prices(
     if exit_pool.empty:
         return merged.iloc[:0]
 
-    # Calculate exit date for each position.
-    # Exit is timed relative to front leg (leg1) expiration, which is standard
-    # calendar spread management: close before the short-dated option expires.
-    # Both expiration and quote_date are already date-normalized at the root.
-    merged = merged.copy()
-    merged["exit_date"] = merged["expiration_leg1"] - pd.Timedelta(days=exit_dte)
-
-    all_exit_dates = merged["exit_date"].unique()
-
     if exit_dte_tolerance == 0:
-        # Exact date matching (original behavior)
-        exit_data = exit_pool[exit_pool["quote_date"].isin(all_exit_dates)]
-    else:
-        # Tolerance-based matching: snap each (underlying_symbol, target exit_date)
-        # independently so one symbol's dates cannot shadow another symbol's exit.
-        tolerance_td = np.timedelta64(exit_dte_tolerance, "D")
-        snapped_rows: list[tuple[Any, Any, Any]] = []
-
-        avail_by_sym = {
-            sym: np.sort(grp["quote_date"].unique())
-            for sym, grp in exit_pool.groupby("underlying_symbol", sort=False)
-        }
-
-        for sym, sym_targets_series in merged.groupby("underlying_symbol", sort=False)[
-            "exit_date"
-        ]:
-            available_dates = avail_by_sym.get(sym)
-            if available_dates is None or len(available_dates) == 0:
-                continue
-
-            targets = np.asarray(
-                sym_targets_series.unique(), dtype=available_dates.dtype
-            )
-            idx = np.searchsorted(available_dates, targets, side="left")
-            idx = np.clip(idx, 0, len(available_dates) - 1)
-
-            left = np.clip(idx - 1, 0, len(available_dates) - 1)
-            right = np.clip(idx, 0, len(available_dates) - 1)
-            diff_left = np.abs(available_dates[left] - targets)
-            diff_right = np.abs(available_dates[right] - targets)
-            nearest_idx = np.where(diff_left <= diff_right, left, right)
-            nearest_dates = available_dates[nearest_idx]
-            nearest_diffs = np.abs(nearest_dates - targets)
-
-            within = nearest_diffs <= tolerance_td
-            for target_dt, snapped_dt in zip(targets[within], nearest_dates[within]):
-                snapped_rows.append((sym, target_dt, snapped_dt))
-
-        if not snapped_rows:
+        # Exact date matching: exit timed relative to front leg (leg1) expiration.
+        merged = merged.copy()
+        merged["exit_date"] = merged["expiration_leg1"] - pd.Timedelta(days=exit_dte)
+        # Never allow exit on or before entry date (prevents look-backward trades)
+        merged = merged[merged["exit_date"] > merged["quote_date"]]
+        if merged.empty:
             return merged.iloc[:0]
 
-        snap_df = pd.DataFrame(
-            snapped_rows,
-            columns=["underlying_symbol", "exit_date", "_snapped_exit_date"],
+        all_exit_dates = merged["exit_date"].unique()
+        exit_data = exit_pool[exit_pool["quote_date"].isin(all_exit_dates)]
+        if exit_data.empty:
+            return merged.iloc[:0]
+
+        for leg_num in [1, 2]:
+            exit_subset, join_cols = _get_exit_leg_subset(
+                exit_data, leg_num, same_strike
+            )
+            merged = pd.merge(merged, exit_subset, on=join_cols, how="inner")
+            if merged.empty:
+                return merged
+
+        return merged
+
+    # Tolerance-based matching: consider only exit dates within
+    # [max(0, exit_dte - exit_dte_tolerance), exit_dte + exit_dte_tolerance]
+    # relative to front expiration (which also guarantees exit_date <= expiration_leg1),
+    # strictly after entry quote_date, and where BOTH legs have quotes, before
+    # selecting the single closest exit per position.
+    if "dte" not in exit_pool.columns:
+        exit_pool = exit_pool.assign(
+            dte=(exit_pool["expiration"] - exit_pool["quote_date"]).dt.days
         )
-        merged = (
-            merged.merge(snap_df, on=["underlying_symbol", "exit_date"], how="inner")
-            .drop(columns=["exit_date"])
-            .rename(columns={"_snapped_exit_date": "exit_date"})
-        )
-        exit_keys = (
-            snap_df[["underlying_symbol", "_snapped_exit_date"]]
-            .rename(columns={"_snapped_exit_date": "quote_date"})
-            .drop_duplicates()
-        )
-        exit_data = exit_pool.merge(
-            exit_keys, on=["underlying_symbol", "quote_date"], how="inner"
-        )
+
+    lower_dte = max(0, exit_dte - exit_dte_tolerance)
+    upper_dte = exit_dte + exit_dte_tolerance
+    front_exit_candidates = _trim(exit_pool, "dte", lower_dte, upper_dte)
+    if front_exit_candidates.empty:
+        return merged.iloc[:0]
+
+    leg1_subset, leg1_join_cols = _get_exit_leg_subset(
+        front_exit_candidates, 1, same_strike
+    )
+    leg1_merge_cols = [c for c in leg1_join_cols if c != "exit_date"]
+    merged = pd.merge(merged, leg1_subset, on=leg1_merge_cols, how="inner")
 
     # Never allow exit on or before entry date (prevents look-backward trades)
     merged = merged[merged["exit_date"] > merged["quote_date"]]
-    if merged.empty or exit_data.empty:
+    if merged.empty:
         return merged.iloc[:0]
 
-    # Merge exit prices for each leg
-    for leg_num in [1, 2]:
-        exit_subset, join_cols = _get_exit_leg_subset(exit_data, leg_num, same_strike)
-        merged = pd.merge(merged, exit_subset, on=join_cols, how="inner")
-        if merged.empty:
-            return merged
+    leg2_pool = exit_pool[exit_pool["quote_date"].isin(merged["exit_date"].unique())]
+    leg2_subset, leg2_join_cols = _get_exit_leg_subset(leg2_pool, 2, same_strike)
+    merged = pd.merge(merged, leg2_subset, on=leg2_join_cols, how="inner")
+    if merged.empty:
+        return merged
 
+    pos_cols = [
+        "underlying_symbol",
+        "quote_date",
+        "option_type",
+        "expiration_leg1",
+        "expiration_leg2",
+    ] + (["strike"] if same_strike else ["strike_leg1", "strike_leg2"])
+    actual_exit_dte = (merged["expiration_leg1"] - merged["exit_date"]).dt.days
+    merged = (
+        merged.assign(
+            _exit_dte_diff=(actual_exit_dte - exit_dte).abs(),
+            _exit_dte_actual=actual_exit_dte,
+        )
+        .sort_values(
+            ["_exit_dte_diff", "_exit_dte_actual", "exit_date"],
+            kind="mergesort",
+        )
+        .drop_duplicates(subset=pos_cols, keep="first")
+        .drop(columns=["_exit_dte_diff", "_exit_dte_actual"])
+        .reset_index(drop=True)
+    )
     return merged
 
 

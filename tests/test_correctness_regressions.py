@@ -1736,3 +1736,256 @@ class TestSignalsRegressions:
         assert pd.Timestamp(res["quote_date_exit"].iloc[0]) == pd.Timestamp(
             "2020-01-20"
         )
+
+
+class TestCoreHighBugRegressions:
+    """Regression tests for second-pass core/strategy high-severity bugs."""
+
+    def test_duplicate_input_index_does_not_duplicate_trades(self):
+        """Concatenated DataFrames with duplicate index labels must not duplicate trades."""
+        exp = "2020-02-01"
+        spy = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-02", 100.0, 4.9, 5.1, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-20", 100.0, 5.9, 6.1, 0.40
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-24", 100.0, 6.9, 7.1, 0.50
+                ),
+            ]
+        )
+        qqq = pd.DataFrame(
+            [
+                _make_option_row(
+                    "QQQ", "call", exp, "2020-01-02", 200.0, 8.9, 9.1, 0.30
+                ),
+                _make_option_row(
+                    "QQQ", "call", exp, "2020-01-20", 200.0, 9.9, 10.1, 0.40
+                ),
+                _make_option_row(
+                    "QQQ", "call", exp, "2020-01-24", 200.0, 10.9, 11.1, 0.50
+                ),
+            ]
+        )
+        # Intentionally omit ignore_index=True -> index is [0, 1, 2, 0, 1, 2]
+        dup_df = pd.concat([spy, qqq])
+        clean_df = pd.concat([spy, qqq], ignore_index=True)
+
+        res_dup = op.long_calls(
+            dup_df, max_entry_dte=45, exit_dte=10, exit_dte_tolerance=3, raw=True
+        )
+        res_clean = op.long_calls(
+            clean_df, max_entry_dte=45, exit_dte=10, exit_dte_tolerance=3, raw=True
+        )
+        assert len(res_dup) == len(res_clean) == 4
+
+    def test_compute_atm_iv_duplicate_index_does_not_pollute_mean(self):
+        """_compute_atm_iv must not pull in non-ATM rows when input index has duplicates."""
+        from optopsy.signals.iv import _compute_atm_iv
+
+        day1 = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY"],
+                "quote_date": pd.to_datetime(["2024-01-02", "2024-01-02"]),
+                "strike": [100.0, 200.0],
+                "close": [100.0, 100.0],
+                "implied_volatility": [0.20, 0.90],
+            }
+        )
+        day2 = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY"],
+                "quote_date": pd.to_datetime(["2024-01-03", "2024-01-03"]),
+                "strike": [200.0, 100.0],
+                "close": [100.0, 100.0],
+                "implied_volatility": [0.95, 0.25],
+            }
+        )
+        concat_df = pd.concat([day1, day2])  # index [0, 1, 0, 1]
+        atm = _compute_atm_iv(concat_df)
+        assert atm["implied_volatility"].tolist() == pytest.approx([0.20, 0.25])
+
+    def test_simulate_handles_custom_strategy_with_duplicate_index(self):
+        """simulate() must not raise AssertionError when a strategy returns duplicate index labels."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-02", 100.0, 4.9, 5.1, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-02", 105.0, 2.9, 3.1, 0.25
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-02-01", 100.0, 6.9, 7.1, 0.50
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-02-01", 105.0, 3.9, 4.1, 0.35
+                ),
+            ]
+        )
+
+        def dup_index_strategy(data, **kwargs):
+            raw = op.long_calls(data, **kwargs)
+            raw.index = pd.Index([0] * len(raw))
+            return raw
+
+        sim = op.simulate(df, dup_index_strategy, max_entry_dte=45, exit_dte=0)
+        assert sim.summary["total_trades"] == 1
+
+    def test_apply_signal_filter_dedups_normalizes_and_ignores_extra_columns(self):
+        """entry_dates with duplicates, non-midnight/tz-aware timestamps, and colliding columns must work."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-02", 100.0, 4.9, 5.1, 0.30
+                ),
+                _make_option_row(
+                    "SPX", "call", exp, "2020-02-01", 100.0, 6.9, 7.1, 0.50
+                ),
+            ]
+        )
+        # Duplicate dates + non-midnight UTC timestamps + colliding column names
+        entry_dates = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPX", "SPX"],
+                "quote_date": pd.to_datetime(
+                    ["2020-01-02 16:00:00+00:00", "2020-01-02 20:30:00+00:00"]
+                ),
+                "dte": [999, 999],
+                "bid": [0.0, 0.0],
+                "ask": [0.0, 0.0],
+            }
+        )
+        res = op.long_calls(
+            df, max_entry_dte=45, exit_dte=0, entry_dates=entry_dates, raw=True
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["quote_date_entry"].iloc[0]) == pd.Timestamp(
+            "2020-01-02"
+        )
+
+    def test_single_leg_exit_dte_tolerance_does_not_shadow_post_entry_exit(self):
+        """A globally closer exit at dte_exit >= dte_entry must not shadow a valid post-entry exit."""
+        exp = "2020-01-20"
+        df = pd.DataFrame(
+            [
+                # Entry at DTE=8 (2020-01-12); diff to exit_dte=7 is 1
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-12", 100.0, 4.9, 5.1, 0.30
+                ),
+                # Valid post-entry exit at DTE=5 (2020-01-15); diff to exit_dte=7 is 2 (within tol=3)
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-15", 100.0, 7.9, 8.1, 0.45
+                ),
+            ]
+        )
+        res = op.long_calls(
+            df,
+            max_entry_dte=30,
+            exit_dte=7,
+            exit_dte_tolerance=3,
+            slippage="mid",
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["quote_date_entry"].iloc[0]) == pd.Timestamp(
+            "2020-01-12"
+        )
+        assert pd.Timestamp(res["quote_date_exit"].iloc[0]) == pd.Timestamp(
+            "2020-01-15"
+        )
+        assert res["exit"].iloc[0] == pytest.approx(8.0)
+
+    def test_calendar_tolerance_ignores_post_expiration_and_single_leg_dates(self):
+        """Calendar exit_dte_tolerance must not snap to dates after expiration_leg1 or missing a leg."""
+        front_exp = "2024-01-19"
+        back_exp = "2024-02-16"
+        df = pd.DataFrame(
+            [
+                # Entry on 2024-01-05 (front DTE=14, back DTE=42)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-05", 100.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-05", 100.0, 4.0, 4.2, 0.30
+                ),
+                # Valid 2-leg exit on 2024-01-17 (front DTE=2, diff=2 from exit_dte=0)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-17", 100.0, 1.0, 1.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-17", 100.0, 3.5, 3.7, 0.30
+                ),
+                # Single-leg-only quote on 2024-01-18 (front DTE=1, closer but back leg missing!)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-18", 100.0, 0.8, 1.0, 0.30
+                ),
+                # Post-expiration back-leg quote on 2024-01-20 (1 day AFTER front_exp!)
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-20", 100.0, 3.0, 3.2, 0.30
+                ),
+            ]
+        )
+        res = op.long_call_calendar(
+            df,
+            front_dte_min=10,
+            front_dte_max=20,
+            back_dte_min=30,
+            back_dte_max=60,
+            exit_dte=0,
+            exit_dte_tolerance=3,
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["exit_date"].iloc[0]) == pd.Timestamp("2024-01-17")
+
+    def test_calendar_tolerance_does_not_snap_to_pre_entry_date(self):
+        """A pre-entry quote closer to target exit_date must not shadow a valid post-entry exit."""
+        front_exp = "2024-01-25"
+        back_exp = "2024-02-25"
+        df = pd.DataFrame(
+            [
+                # Pre-entry date 2024-01-17 (front DTE=8, diff=1 from exit_dte=7)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-17", 100.0, 2.5, 2.7, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-17", 100.0, 4.5, 4.7, 0.30
+                ),
+                # Entry on 2024-01-18 (front DTE=7)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-18", 100.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-18", 100.0, 4.0, 4.2, 0.30
+                ),
+                # Valid post-entry exit on 2024-01-20 (front DTE=5, diff=2 from exit_dte=7)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-20", 100.0, 1.0, 1.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-20", 100.0, 3.5, 3.7, 0.30
+                ),
+            ]
+        )
+        entry_dates = pd.DataFrame(
+            {"underlying_symbol": ["SPY"], "quote_date": [pd.Timestamp("2024-01-18")]}
+        )
+        res = op.long_call_calendar(
+            df,
+            front_dte_min=5,
+            front_dte_max=20,
+            back_dte_min=30,
+            back_dte_max=60,
+            exit_dte=7,
+            exit_dte_tolerance=3,
+            entry_dates=entry_dates,
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["exit_date"].iloc[0]) == pd.Timestamp("2024-01-20")
