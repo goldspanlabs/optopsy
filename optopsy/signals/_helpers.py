@@ -30,14 +30,15 @@ def _groupby_symbol(
     if data.empty:
         return pd.Series(False, index=data.index, dtype=bool)
 
-    work = data.reset_index(drop=True)
+    work = data if data.index.is_unique else data.reset_index(drop=True)
 
     def _run_sorted(group: pd.DataFrame) -> "pd.Series[bool]":
         if (
             "quote_date" in group.columns
             and not group["quote_date"].is_monotonic_increasing
         ):
-            group = group.sort_values("quote_date", kind="mergesort")
+            order = group["quote_date"].to_numpy().argsort(kind="mergesort")
+            group = group.iloc[order]
         return compute_group(group)
 
     # Single-symbol fast path avoids groupby/concat overhead

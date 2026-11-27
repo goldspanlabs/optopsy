@@ -1652,6 +1652,18 @@ class TestSignalsRegressions:
         mask = sustained(_custom_up, days=1)(df)
         assert not mask.any()
 
+        # Unique custom index (e.g. DatetimeIndex) must be preserved inside callback
+        df_dt = df[df["underlying_symbol"] == "AAA"].set_index("quote_date", drop=False)
+        seen_dt_index: list[bool] = []
+
+        def _check_idx(g: pd.DataFrame) -> "pd.Series[bool]":
+            seen_dt_index.append(isinstance(g.index, pd.DatetimeIndex))
+            return pd.Series(True, index=g.index)
+
+        out_dt = sustained(_check_idx, days=1)(df_dt)
+        assert seen_dt_index and all(seen_dt_index)
+        assert out_dt.index.equals(df_dt.index)
+
     def test_stock_data_multiindex_custom_ticker_level_name(self):
         """Multi-ticker stock_data with MultiIndex levels ['Price', 'ticker'] must preserve symbols."""
         exp = "2020-02-01"
