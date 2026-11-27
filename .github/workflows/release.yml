@@ -41,6 +41,11 @@ on:
         description: "Release notes (leave empty to auto-generate from merged PRs)"
         required: false
         type: string
+      dry_run:
+        description: "Only compute and check the version, tag and release state; make no commit, tag, release, or PyPI publish"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -132,8 +137,29 @@ jobs:
           echo "tag_exists=$tag_exists" >> "$GITHUB_OUTPUT"
           echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
 
+      - name: Dry run summary
+        if: inputs.dry_run
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION_OUT: ${{ steps.version.outputs.version }}
+          CURRENT: ${{ steps.version.outputs.current }}
+          NEEDS_BUMP: ${{ steps.version.outputs.needs_bump }}
+          TAG_EXISTS: ${{ steps.state.outputs.tag_exists }}
+          RELEASE_EXISTS: ${{ steps.state.outputs.release_exists }}
+        run: |
+          {
+            echo "### Release dry run"
+            echo "- Current version: \`$CURRENT\`"
+            echo "- Target version: \`$VERSION_OUT\` (tag \`$TAG\`)"
+            echo "- Version bump needed: \`$NEEDS_BUMP\`"
+            echo "- Tag exists: \`$TAG_EXISTS\`"
+            echo "- Release exists: \`$RELEASE_EXISTS\`"
+            echo ""
+            echo "Nothing was committed, tagged, released, or published."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Commit and push version bump
-        if: steps.state.outputs.release_exists == 'false' && steps.version.outputs.needs_bump == 'true'
+        if: ${{ !inputs.dry_run && steps.state.outputs.release_exists == 'false' && steps.version.outputs.needs_bump == 'true' }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -152,7 +178,7 @@ jobs:
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Create GitHub release
-        if: steps.state.outputs.release_exists == 'false'
+        if: ${{ !inputs.dry_run && steps.state.outputs.release_exists == 'false' }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
@@ -171,6 +197,7 @@ jobs:
           gh release create "$TAG" "${args[@]}"
 
       - name: Dispatch PyPI publish
+        if: ${{ !inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
