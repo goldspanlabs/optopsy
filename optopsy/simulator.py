@@ -81,6 +81,7 @@ _TRADE_LOG_COLUMNS = [
     "multiplier",
     "dollar_cost",
     "dollar_proceeds",
+    "commission",
     "realized_pnl",
     "pct_change",
     "cumulative_pnl",
@@ -170,6 +171,10 @@ def _normalise_trades(
         has_early = pd.notna(early)
         df["exit_date"] = np.where(has_early, early, np.asarray(df["exit_date"]))
 
+    df["commission"] = (
+        raw["total_commission"].fillna(0.0).values
+        if "total_commission" in raw.columns else 0.0
+    )
     return df
 
 
@@ -594,6 +599,8 @@ def _build_trade_log(
             "expiration": trades["expiration"].values,
             "entry_cost": trades["entry_cost"].values,
             "exit_proceeds": trades["exit_proceeds"].values,
+            "commission": trades.get("commission", pd.Series(0.0, index=trades.index)).values
+            * quantity,
             "quantity": quantity,
             "multiplier": multiplier,
             "pct_change": trades["pct_change"].values,
@@ -609,7 +616,7 @@ def _build_trade_log(
     trade_log["dollar_proceeds"] = trade_log["exit_proceeds"] * lot_size
     trade_log["realized_pnl"] = (
         trade_log["exit_proceeds"] - trade_log["entry_cost"]
-    ) * lot_size
+    ) * lot_size - trade_log["commission"]
     trade_log["days_held"] = (
         pd.to_datetime(trade_log["exit_date"]) - pd.to_datetime(trade_log["entry_date"])
     ).dt.days
@@ -942,3 +949,4 @@ def _combine_equity_curves(
     combined = pd.DataFrame(daily_curves).sum(axis=1)
     combined.name = "equity"
     return combined
+
