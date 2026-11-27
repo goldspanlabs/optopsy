@@ -1,6 +1,14 @@
-# One-click release: bumps the version, commits it, tags it, creates the
-# GitHub release, and then runs python-publish.yml against the new tag to
-# upload to PyPI.
+# One-click release: bumps the version, verifies the bumped tree (CI state,
+# lint, full test suite, and the built wheel installed into a clean venv),
+# then commits, tags, creates the GitHub release, and optionally runs
+# python-publish.yml against the new tag to upload to PyPI.
+#
+# Verification runs before anything is pushed or tagged. The working tree that
+# is verified is the same tree that gets committed.
+#
+# Publishing is opt-in: the `publish` input must be ticked. A pre-release flag
+# only marks the GitHub release. It does not stop the PyPI upload, so betas
+# are only published when `publish` is set.
 #
 # Why python-publish is dispatched explicitly: events created with the default
 # GITHUB_TOKEN do not trigger other workflows, so the `release: published`
@@ -33,7 +41,12 @@ on:
           - major
         default: patch
       prerelease:
-        description: "Mark the GitHub release as a pre-release"
+        description: "Mark the GitHub release as a pre-release (does not affect PyPI)"
+        required: true
+        type: boolean
+        default: false
+      publish:
+        description: "Upload to PyPI. Off by default: leave unticked for a dry check or a GitHub-only release."
         required: true
         type: boolean
         default: false
@@ -42,7 +55,7 @@ on:
         required: false
         type: string
       dry_run:
-        description: "Only compute and check the version, tag and release state; make no commit, tag, release, or PyPI publish"
+        description: "Run every check and the wheel build, but make no commit, tag, release, or PyPI publish"
         required: false
         type: boolean
         default: false
@@ -137,6 +150,90 @@ jobs:
           echo "tag_exists=$tag_exists" >> "$GITHUB_OUTPUT"
           echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
 
+      - name: Require green CI on the source commit
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The release commit is pushed with GITHUB_TOKEN, which does not trigger
+          # CI. So CI is checked on the commit it is built from ($GITHUB_SHA).
+          endpoint="repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100"
+          if ! total=$(gh api "$endpoint" --jq '.total_count'); then
+            echo "::error::Could not read check runs for $GITHUB_SHA"
+            exit 1
+          fi
+          if [ "$total" -eq 0 ]; then
+            echo "::error::No check runs found for $GITHUB_SHA"
+            exit 1
+          fi
+          bad=$(gh api "$endpoint" --jq '.check_runs[] | select(.status != "completed" or ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not)) | "\(.name): \(.status)/\(.conclusion)"')
+          if [ -n "$bad" ]; then
+            echo "::error::CI is not green on $GITHUB_SHA:"
+            echo "$bad"
+            exit 1
+          fi
+
+      - name: Apply version to pyproject.toml
+        if: ${{ steps.state.outputs.release_exists == 'false' && steps.version.outputs.needs_bump == 'true' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$VERSION\"/" pyproject.toml
+          grep -q "^version = \"$VERSION\"" pyproject.toml
+
+      - name: Set up uv
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        run: uv sync --extra data --extra ui
+
+      - name: Lint and type check
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        run: |
+          uv run ruff format --check optopsy/ tests/
+          uv run ruff check optopsy/ tests/
+          uv run ty check optopsy/
+
+      - name: Run test suite
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        run: uv run pytest tests/ -v
+
+      - name: Build wheel and sdist
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        run: uv build
+
+      - name: Test the built wheel in a clean environment
+        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A fresh venv outside the repo, so optopsy can only come from the wheel.
+          wheel=$(ls dist/optopsy-*.whl)
+          py=$(uv python find 3.13)
+          "$py" -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/pip" install -q "${wheel}[data,ui]" pytest
+
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-venv/bin/python" - <<'PY'
+          import importlib.metadata as md, os, optopsy
+          version = os.environ["VERSION"]
+          assert md.version("optopsy") == version, (md.version("optopsy"), version)
+          assert "wheel-venv" in optopsy.__file__, optopsy.__file__
+          print("installed", optopsy.__file__, md.version("optopsy"))
+          PY
+
+          # Run the full suite against the installed package, not the source tree.
+          mkdir -p "$RUNNER_TEMP/wheel-check"
+          cp -r "$GITHUB_WORKSPACE/tests" "$RUNNER_TEMP/wheel-check/tests"
+          cd "$RUNNER_TEMP/wheel-check"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pytest tests -q -p no:cacheprovider
+
       - name: Dry run summary
         if: inputs.dry_run
         env:
@@ -155,7 +252,7 @@ jobs:
             echo "- Tag exists: \`$TAG_EXISTS\`"
             echo "- Release exists: \`$RELEASE_EXISTS\`"
             echo ""
-            echo "Nothing was committed, tagged, released, or published."
+            echo "All checks above ran. Nothing was committed, tagged, released, or published."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit and push version bump
@@ -165,16 +262,8 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          pyproject_version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
-          if [ "$pyproject_version" != "$VERSION" ]; then
-            sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$VERSION\"/" pyproject.toml
-          fi
           git add pyproject.toml
-          if git diff --cached --quiet; then
-            echo "Version already set in pyproject.toml; nothing to commit"
-          else
-            git commit -m "Release v$VERSION"
-          fi
+          git commit -m "Release v$VERSION"
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Create GitHub release
@@ -197,7 +286,7 @@ jobs:
           gh release create "$TAG" "${args[@]}"
 
       - name: Dispatch PyPI publish
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && inputs.publish }}
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}

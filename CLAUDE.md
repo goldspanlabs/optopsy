@@ -203,11 +203,15 @@ Publishing to PyPI is automated via GitHub Actions (`.github/workflows/python-pu
 1. In GitHub Actions, run **Release** (workflow_dispatch). Inputs:
    - `version` — exact version (e.g., `2.3.1`, `2.4.0b1`), or leave empty to bump
    - `bump` — `patch` / `minor` / `major` when `version` is empty
-   - `prerelease` — mark the GitHub release as a pre-release
+   - `prerelease` — mark the GitHub release as a pre-release (this does **not** stop the PyPI upload)
+   - `publish` — upload to PyPI; off by default, so tick it only for a real release
    - `notes` — optional; auto-generated from merged PRs if empty
-2. The workflow bumps `version` in `pyproject.toml`, commits and pushes it to the branch you ran it on, creates the `v<version>` tag and GitHub release, then dispatches `python-publish.yml` on that tag to upload to PyPI.
+   - `dry_run` — run every check and build the wheel, without committing, tagging, releasing, or publishing
+2. Before anything is pushed, the workflow bumps `pyproject.toml` and checks the bumped tree: CI must be green on the source commit, then lint, type check, the full test suite, and the wheel build run. The full test suite is then run against the wheel installed into a clean venv.
+3. If checks pass, it commits and pushes the bump to the branch you ran it on, creates the `v<version>` tag and GitHub release, and, if `publish` is ticked, dispatches `python-publish.yml` on that tag.
 
 Notes:
+- The release commit is pushed with `GITHUB_TOKEN`, which doesn't trigger CI, so the workflow runs the tests itself rather than relying on CI for that commit.
 - Releases created by the workflow's `GITHUB_TOKEN` do not trigger `release: published`, which is why publish is dispatched explicitly. A release created by hand still triggers publish automatically.
 - No API tokens are needed; PyPI uses trusted publishing.
 - Manual fallback: bump `pyproject.toml`, commit and push, then create the release against that commit (add `--prerelease` for betas). Pass `--target` explicitly, or the tag is created at the default branch's HEAD instead:
