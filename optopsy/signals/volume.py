@@ -16,6 +16,30 @@ from ._helpers import (
 # ---------------------------------------------------------------------------
 
 
+def _compute_mfi(
+    high: "pd.Series | None",
+    low: "pd.Series | None",
+    close: pd.Series,
+    volume: pd.Series,
+    period: int,
+) -> "pd.Series | None":
+    """Compute Money Flow Index in float64 (avoids pandas 3.0 int64 upcast bug in ta.mfi)."""
+    period = int(period)
+    if high is None or low is None or period <= 0 or len(close) <= period:
+        return None
+    tp = (
+        high.astype("float64") + low.astype("float64") + close.astype("float64")
+    ) / 3.0
+    rmf = tp * volume.astype("float64")
+    tp_diff = tp.diff()
+    pos_mf = rmf.where(tp_diff > 0, 0.0).rolling(period, min_periods=period).sum()
+    neg_mf = rmf.where(tp_diff < 0, 0.0).rolling(period, min_periods=period).sum()
+    total_mf = pos_mf + neg_mf
+    mfi = 100.0 * pos_mf / total_mf.replace(0.0, float("nan"))
+    mfi.iloc[:period] = float("nan")
+    return mfi
+
+
 def mfi_above(period: int = 14, threshold: float = 80) -> SignalFunc:
     """True when MFI is above threshold (overbought / strong buying pressure)."""
 
@@ -27,7 +51,7 @@ def mfi_above(period: int = 14, threshold: float = 80) -> SignalFunc:
         volume = _get_volume(group)
         if volume is None:
             return None
-        return ta.mfi(high, low, close, volume, length=period)
+        return _compute_mfi(high, low, close, volume, period)
 
     return _ohlcv_signal(_indicator, lambda ind: ind > threshold)
 
@@ -43,7 +67,7 @@ def mfi_below(period: int = 14, threshold: float = 20) -> SignalFunc:
         volume = _get_volume(group)
         if volume is None:
             return None
-        return ta.mfi(high, low, close, volume, length=period)
+        return _compute_mfi(high, low, close, volume, period)
 
     return _ohlcv_signal(_indicator, lambda ind: ind < threshold)
 

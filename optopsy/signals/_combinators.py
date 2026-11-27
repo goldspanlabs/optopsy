@@ -203,13 +203,13 @@ def custom_signal(df: pd.DataFrame, flag_col: str = "signal") -> SignalFunc:
 
     flags = df[flag_col].fillna(False).astype(bool)
     valid = df.loc[flags, ["underlying_symbol", "quote_date"]].copy()
-    valid["quote_date"] = normalize_dates(valid["quote_date"])
+    valid["quote_date"] = normalize_dates(pd.to_datetime(valid["quote_date"]))
     valid_idx = pd.MultiIndex.from_arrays(
         [valid["underlying_symbol"], valid["quote_date"]]
     )
 
     def _signal(data: pd.DataFrame) -> "pd.Series[bool]":
-        dates = normalize_dates(data["quote_date"])
+        dates = normalize_dates(pd.to_datetime(data["quote_date"]))
         lookup = pd.MultiIndex.from_arrays([data["underlying_symbol"], dates])
         return pd.Series(lookup.isin(valid_idx), index=data.index, dtype=bool)
 

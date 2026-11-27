@@ -155,3 +155,27 @@ def _rule_expiration_ordering(data: pd.DataFrame, leg_def: List[Tuple]) -> pd.Da
         return data
 
     return data[data["expiration_leg1"] < data["expiration_leg2"]]
+
+
+def _rule_diagonal_spread(data: pd.DataFrame, leg_def: List[Tuple]) -> pd.DataFrame:
+    """
+    Filter diagonal spread strategies to ensure front expires before back and strikes differ.
+
+    Diagonal spreads require:
+    - expiration_leg1 (front/short-term) < expiration_leg2 (back/long-term)
+    - strike_leg1 != strike_leg2 (same-strike positions are calendar spreads)
+
+    Args:
+        data: DataFrame containing diagonal spread strategy data
+        leg_def: List of tuples defining strategy legs
+
+    Returns:
+        Filtered DataFrame with valid diagonal spread configurations
+    """
+    if len(leg_def) != 2:
+        return data
+
+    return data[
+        (data["expiration_leg1"] < data["expiration_leg2"])
+        & (data["strike_leg1"] != data["strike_leg2"])
+    ]

@@ -368,6 +368,8 @@ def _normalise_calendar(raw: pd.DataFrame) -> pd.DataFrame:
 def _select_one(candidates: pd.DataFrame, idx: Any) -> pd.Series:
     """Return a single row from *candidates* at the given index label."""
     result = candidates.loc[idx]
+    if isinstance(result, pd.DataFrame):
+        return result.iloc[0]
     assert isinstance(result, pd.Series)
     return result
 
@@ -384,6 +386,18 @@ def _select_by_extremum(
 
 def _select_nearest(candidates: pd.DataFrame) -> pd.Series:
     """Select the trade closest to ATM (delta closest to 0.50)."""
+    # Stock-backed strategies (covered call, protective put, collar with stock_data)
+    # set delta_entry_leg1 = 1.0 for the stock leg; target the option leg instead.
+    if (
+        "option_type_leg1" in candidates.columns
+        and bool((candidates["option_type_leg1"] == "stock").all())
+        and "delta_entry_leg2" in candidates.columns
+        and candidates["delta_entry_leg2"].notna().any()
+    ):
+        return _select_by_extremum(
+            candidates, (candidates["delta_entry_leg2"].abs() - 0.50).abs()
+        )
+
     for delta_col in ("delta_entry", "delta_entry_leg1", "delta_leg1"):
         if delta_col in candidates.columns and candidates[delta_col].notna().any():
             return _select_by_extremum(
@@ -767,6 +781,16 @@ def _unwrap_strategy_name(strategy: Callable[..., Any]) -> str:
     return getattr(fn, "__name__", "")
 
 
+def _extract_partial_kwarg(strategy: Callable[..., Any], key: str) -> tuple[bool, Any]:
+    """Return ``(True, value)`` if *key* is bound in a ``functools.partial`` chain."""
+    fn: Any = strategy
+    while isinstance(fn, partial):
+        if fn.keywords and key in fn.keywords:
+            return True, fn.keywords[key]
+        fn = fn.func
+    return False, None
+
+
 def simulate(
     data: pd.DataFrame,
     strategy: Callable[..., pd.DataFrame],
@@ -831,11 +855,19 @@ def simulate(
 
     # Scale only per-contract and per-share fees for the simulated lot size.
     # Base/minimum fees remain one charge per side of the simulated trade.
+    # Also inspect commissions bound via functools.partial so lot scaling is
+    # not skipped when callers pass partial(op.short_puts, commission=...).
     strategy_kwargs = strategy_kwargs.copy()
     if "commission" in strategy_kwargs:
         strategy_kwargs["commission"] = _scale_commission_for_quantity(
             strategy_kwargs["commission"], quantity, multiplier
         )
+    else:
+        has_bound_comm, bound_comm = _extract_partial_kwarg(strategy, "commission")
+        if has_bound_comm and bound_comm is not None:
+            strategy_kwargs["commission"] = _scale_commission_for_quantity(
+                bound_comm, quantity, multiplier
+            )
 
     # Generate raw trades — return empty result for empty input
     if data.empty:
@@ -852,7 +884,7 @@ def simulate(
             summary=_compute_summary(empty_log, capital),
         )
 
-    raw = _adjust_candidate_returns(raw.copy(), quantity * multiplier)
+    raw = _adjust_candidate_returns(raw.reset_index(drop=True), quantity * multiplier)
 
     # Select one trade per entry date (on raw data so OTM% columns are
     # available to selectors)
@@ -881,7 +913,10 @@ def simulate(
     trades = _normalise_trades(
         selected_raw, is_short_single=is_short_single, exit_dte=exit_dte
     )
-    trades = trades.sort_values("entry_date").reset_index(drop=True)
+    sort_cols = ["entry_date"] + (
+        ["underlying_symbol"] if "underlying_symbol" in trades.columns else []
+    )
+    trades = trades.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
     # Filter trades by position limits and overlap rules
     filtered = _filter_trades(trades, max_positions)
@@ -946,6 +981,16 @@ def simulate_portfolio(
     if not legs:
         raise ValueError("legs must be a non-empty list")
 
+    if (
+        isinstance(capital, bool)
+        or not isinstance(capital, (int, float))
+        or not np.isfinite(capital)
+        or capital <= 0
+    ):
+        raise ValueError(
+            "Invalid setting for capital, must be a positive finite int or float"
+        )
+
     # Validate each leg has required keys
     for i, leg in enumerate(legs):
         for key in ("data", "strategy", "weight"):
@@ -967,7 +1012,6 @@ def simulate_portfolio(
 
     # Run each leg
     leg_results: dict[str, SimulationResult] = {}
-    leg_capitals: dict[str, float] = {}
     seen_names: set[str] = set()
 
     for i, leg in enumerate(legs):
@@ -986,7 +1030,6 @@ def simulate_portfolio(
         seen_names.add(name)
 
         leg_capital = capital * weight
-        leg_capitals[name] = leg_capital
 
         # Build kwargs for simulate(): everything except reserved keys
         sim_kwargs: dict[str, Any] = {
@@ -996,11 +1039,12 @@ def simulate_portfolio(
 
         leg_results[name] = simulate(data, strategy, **sim_kwargs)
 
-    # Combine trade logs
+    # Combine trade logs (already applies portfolio-level ruin truncation)
     combined_log = _combine_trade_logs(leg_results, capital)
 
-    # Combine equity curves — pass leg_capitals so idle cash is represented
-    combined_curve = _combine_equity_curves(leg_results, leg_capitals)
+    # Build daily portfolio equity curve from the retained combined trade log so
+    # it always agrees with trade_log and summary (including after ruin).
+    combined_curve = _build_portfolio_equity_curve(combined_log)
 
     # Compute portfolio summary from combined trade log
     summary = _compute_summary(combined_log, capital)
@@ -1032,66 +1076,37 @@ def _combine_trade_logs(
     combined = pd.concat(all_logs, ignore_index=True)
     # Sort by exit_date (when P&L is realized) for correct cumulative equity,
     # with entry_date and leg as deterministic tie-breakers.
-    combined = combined.sort_values(["exit_date", "entry_date", "leg"]).reset_index(
-        drop=True
-    )
+    combined = combined.sort_values(
+        ["exit_date", "entry_date", "leg"], kind="mergesort"
+    ).reset_index(drop=True)
     combined["trade_id"] = np.arange(1, len(combined) + 1)
     combined["cumulative_pnl"] = combined["realized_pnl"].cumsum()
     combined["equity"] = capital + combined["cumulative_pnl"]
+
+    # Ruin check: truncate at first trade where portfolio equity <= 0
+    # (prevents sign-inverted pct_change() returns on negative equity).
+    ruin_mask = combined["equity"] <= 0
+    if ruin_mask.any():
+        ruin_idx = ruin_mask.idxmax()
+        combined = combined.loc[:ruin_idx]
+
     return combined
 
 
-def _combine_equity_curves(
-    leg_results: dict[str, SimulationResult],
-    leg_capitals: dict[str, float],
-) -> pd.Series:
-    """Sum per-leg daily equity curves into a portfolio equity curve.
+def _build_portfolio_equity_curve(combined_log: pd.DataFrame) -> pd.Series:
+    """Build a daily portfolio equity curve from the combined trade log.
 
-    Each leg's curve is seeded with its starting capital so that idle cash
-    (before a leg's first trade closes or for legs that never trade) is
-    correctly represented in the portfolio total.
+    ``combined_log["equity"]`` already incorporates total starting capital
+    across all legs (including idle cash) and reflects portfolio ruin
+    truncation. When multiple trades close on the same exit date, the final
+    retained equity for that date is used, then resampled to daily frequency
+    with forward-fill.
     """
-    # Collect non-empty curves and determine the portfolio date range
-    raw_curves: dict[str, pd.Series] = {}
-    all_dates: list[pd.Timestamp] = []
-    for name, result in leg_results.items():
-        if result.equity_curve.empty:
-            continue
-        curve = result.equity_curve.copy()
-        curve.index = pd.to_datetime(curve.index)
-        raw_curves[name] = curve
-        all_dates.extend([curve.index.min(), curve.index.max()])
-
-    if not all_dates:
+    if combined_log.empty:
         return pd.Series(dtype=float, name="equity")
 
-    portfolio_start = min(all_dates)
-    portfolio_end = max(all_dates)
-    full_index = pd.date_range(portfolio_start, portfolio_end, freq="D")
-
-    # Build a daily curve for each leg, seeded with its starting capital
-    daily_curves: dict[str, pd.Series] = {}
-    for name in leg_results:
-        start_cap = leg_capitals.get(name, 0.0)
-
-        if name in raw_curves:
-            daily = raw_curves[name].resample("D").last().ffill()
-            # Prepend starting capital for days before first trade exit
-            first_date = daily.index.min()
-            if portfolio_start < first_date:
-                pre_index = pd.date_range(
-                    portfolio_start, first_date - pd.Timedelta(days=1), freq="D"
-                )
-                if len(pre_index) > 0:
-                    pre = pd.Series(start_cap, index=pre_index)
-                    daily = pd.concat([pre, daily])
-            daily = daily.reindex(full_index).ffill()
-        else:
-            # Leg never traded — flat line at allocated capital
-            daily = pd.Series(start_cap, index=full_index)
-
-        daily_curves[name] = daily
-
-    combined = pd.DataFrame(daily_curves).sum(axis=1)
-    combined.name = "equity"
-    return combined
+    daily = combined_log.groupby("exit_date")["equity"].last()
+    daily.index = pd.to_datetime(daily.index)
+    daily = daily.sort_index().resample("D").last().ffill()
+    daily.name = "equity"
+    return daily

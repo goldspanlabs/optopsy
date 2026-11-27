@@ -1445,14 +1445,24 @@ class TestSpotCheckCalendar:
     """Hand-calculated P&L for calendar spreads."""
 
     @pytest.mark.parametrize(
-        ("strategy", "back_strike"),
-        [(op.long_call_calendar, 100), (op.long_call_diagonal, 105)],
+        ("strategy", "back_strike", "back_delta"),
+        [
+            (op.long_call_calendar, 100, 0.3),
+            (op.long_call_diagonal, 105, 0.5),
+        ],
     )
     @pytest.mark.parametrize("entry", [0.0, 0.005, -0.005, 0.01, -0.01])
     @pytest.mark.parametrize("commission", [None, 0.65])
     @pytest.mark.parametrize(("quantity", "multiplier"), [(1, 100), (3, 10)])
     def test_near_zero_entry_return_guard(
-        self, strategy, back_strike, entry, commission, quantity, multiplier
+        self,
+        strategy,
+        back_strike,
+        back_delta,
+        entry,
+        commission,
+        quantity,
+        multiplier,
     ):
         data = pd.DataFrame(
             [
@@ -1465,7 +1475,7 @@ class TestSpotCheckCalendar:
                     back_strike,
                     1 + entry,
                     1 + entry,
-                    0.3,
+                    back_delta,
                 ],
                 ["TEST", "call", "2026-02-01", "2026-01-25", 100, 0.5, 0.5, 0.3],
                 [
@@ -1476,7 +1486,7 @@ class TestSpotCheckCalendar:
                     back_strike,
                     0.6,
                     0.6,
-                    0.3,
+                    back_delta,
                 ],
             ],
             columns=_CHAIN_COLS,

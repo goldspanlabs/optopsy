@@ -1736,3 +1736,869 @@ class TestSignalsRegressions:
         assert pd.Timestamp(res["quote_date_exit"].iloc[0]) == pd.Timestamp(
             "2020-01-20"
         )
+
+
+class TestCoreHighBugRegressions:
+    """Regression tests for second-pass core/strategy high-severity bugs."""
+
+    def test_duplicate_input_index_does_not_duplicate_trades(self):
+        """Concatenated DataFrames with duplicate index labels must not duplicate trades."""
+        exp = "2020-02-01"
+        spy = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-02", 100.0, 4.9, 5.1, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-20", 100.0, 5.9, 6.1, 0.40
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-24", 100.0, 6.9, 7.1, 0.50
+                ),
+            ]
+        )
+        qqq = pd.DataFrame(
+            [
+                _make_option_row(
+                    "QQQ", "call", exp, "2020-01-02", 200.0, 8.9, 9.1, 0.30
+                ),
+                _make_option_row(
+                    "QQQ", "call", exp, "2020-01-20", 200.0, 9.9, 10.1, 0.40
+                ),
+                _make_option_row(
+                    "QQQ", "call", exp, "2020-01-24", 200.0, 10.9, 11.1, 0.50
+                ),
+            ]
+        )
+        # Intentionally omit ignore_index=True -> index is [0, 1, 2, 0, 1, 2]
+        dup_df = pd.concat([spy, qqq])
+        clean_df = pd.concat([spy, qqq], ignore_index=True)
+
+        res_dup = op.long_calls(
+            dup_df, max_entry_dte=45, exit_dte=10, exit_dte_tolerance=3, raw=True
+        )
+        res_clean = op.long_calls(
+            clean_df, max_entry_dte=45, exit_dte=10, exit_dte_tolerance=3, raw=True
+        )
+        assert len(res_dup) == len(res_clean) == 4
+
+    def test_compute_atm_iv_duplicate_index_does_not_pollute_mean(self):
+        """_compute_atm_iv must not pull in non-ATM rows when input index has duplicates."""
+        from optopsy.signals.iv import _compute_atm_iv
+
+        day1 = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY"],
+                "quote_date": pd.to_datetime(["2024-01-02", "2024-01-02"]),
+                "strike": [100.0, 200.0],
+                "close": [100.0, 100.0],
+                "implied_volatility": [0.20, 0.90],
+            }
+        )
+        day2 = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY"],
+                "quote_date": pd.to_datetime(["2024-01-03", "2024-01-03"]),
+                "strike": [200.0, 100.0],
+                "close": [100.0, 100.0],
+                "implied_volatility": [0.95, 0.25],
+            }
+        )
+        concat_df = pd.concat([day1, day2])  # index [0, 1, 0, 1]
+        atm = _compute_atm_iv(concat_df)
+        assert atm["implied_volatility"].tolist() == pytest.approx([0.20, 0.25])
+
+    def test_simulate_handles_custom_strategy_with_duplicate_index(self):
+        """simulate() must not raise AssertionError when a strategy returns duplicate index labels."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-02", 100.0, 4.9, 5.1, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-01-02", 105.0, 2.9, 3.1, 0.25
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-02-01", 100.0, 6.9, 7.1, 0.50
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2020-02-01", 105.0, 3.9, 4.1, 0.35
+                ),
+            ]
+        )
+
+        def dup_index_strategy(data, **kwargs):
+            raw = op.long_calls(data, **kwargs)
+            raw.index = pd.Index([0] * len(raw))
+            return raw
+
+        sim = op.simulate(df, dup_index_strategy, max_entry_dte=45, exit_dte=0)
+        assert sim.summary["total_trades"] == 1
+
+    def test_apply_signal_filter_dedups_normalizes_and_ignores_extra_columns(self):
+        """entry_dates with duplicates, non-midnight/tz-aware timestamps, and colliding columns must work."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-02", 100.0, 4.9, 5.1, 0.30
+                ),
+                _make_option_row(
+                    "SPX", "call", exp, "2020-02-01", 100.0, 6.9, 7.1, 0.50
+                ),
+            ]
+        )
+        # Duplicate dates + non-midnight UTC timestamps + colliding column names
+        entry_dates = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPX", "SPX"],
+                "quote_date": pd.to_datetime(
+                    ["2020-01-02 16:00:00+00:00", "2020-01-02 20:30:00+00:00"]
+                ),
+                "dte": [999, 999],
+                "bid": [0.0, 0.0],
+                "ask": [0.0, 0.0],
+            }
+        )
+        res = op.long_calls(
+            df, max_entry_dte=45, exit_dte=0, entry_dates=entry_dates, raw=True
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["quote_date_entry"].iloc[0]) == pd.Timestamp(
+            "2020-01-02"
+        )
+
+    def test_single_leg_exit_dte_tolerance_does_not_shadow_post_entry_exit(self):
+        """A globally closer exit at dte_exit >= dte_entry must not shadow a valid post-entry exit."""
+        exp = "2020-01-20"
+        df = pd.DataFrame(
+            [
+                # Entry at DTE=8 (2020-01-12); diff to exit_dte=7 is 1
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-12", 100.0, 4.9, 5.1, 0.30
+                ),
+                # Valid post-entry exit at DTE=5 (2020-01-15); diff to exit_dte=7 is 2 (within tol=3)
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-15", 100.0, 7.9, 8.1, 0.45
+                ),
+            ]
+        )
+        res = op.long_calls(
+            df,
+            max_entry_dte=30,
+            exit_dte=7,
+            exit_dte_tolerance=3,
+            slippage="mid",
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["quote_date_entry"].iloc[0]) == pd.Timestamp(
+            "2020-01-12"
+        )
+        assert pd.Timestamp(res["quote_date_exit"].iloc[0]) == pd.Timestamp(
+            "2020-01-15"
+        )
+        assert res["exit"].iloc[0] == pytest.approx(8.0)
+
+    def test_calendar_tolerance_ignores_post_expiration_and_single_leg_dates(self):
+        """Calendar exit_dte_tolerance must not snap to dates after expiration_leg1 or missing a leg."""
+        front_exp = "2024-01-19"
+        back_exp = "2024-02-16"
+        df = pd.DataFrame(
+            [
+                # Entry on 2024-01-05 (front DTE=14, back DTE=42)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-05", 100.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-05", 100.0, 4.0, 4.2, 0.30
+                ),
+                # Valid 2-leg exit on 2024-01-17 (front DTE=2, diff=2 from exit_dte=0)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-17", 100.0, 1.0, 1.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-17", 100.0, 3.5, 3.7, 0.30
+                ),
+                # Single-leg-only quote on 2024-01-18 (front DTE=1, closer but back leg missing!)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-18", 100.0, 0.8, 1.0, 0.30
+                ),
+                # Post-expiration back-leg quote on 2024-01-20 (1 day AFTER front_exp!)
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-20", 100.0, 3.0, 3.2, 0.30
+                ),
+            ]
+        )
+        res = op.long_call_calendar(
+            df,
+            front_dte_min=10,
+            front_dte_max=20,
+            back_dte_min=30,
+            back_dte_max=60,
+            exit_dte=0,
+            exit_dte_tolerance=3,
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["exit_date"].iloc[0]) == pd.Timestamp("2024-01-17")
+
+    def test_calendar_tolerance_does_not_snap_to_pre_entry_date(self):
+        """A pre-entry quote closer to target exit_date must not shadow a valid post-entry exit."""
+        front_exp = "2024-01-25"
+        back_exp = "2024-02-25"
+        df = pd.DataFrame(
+            [
+                # Pre-entry date 2024-01-17 (front DTE=8, diff=1 from exit_dte=7)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-17", 100.0, 2.5, 2.7, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-17", 100.0, 4.5, 4.7, 0.30
+                ),
+                # Entry on 2024-01-18 (front DTE=7)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-18", 100.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-18", 100.0, 4.0, 4.2, 0.30
+                ),
+                # Valid post-entry exit on 2024-01-20 (front DTE=5, diff=2 from exit_dte=7)
+                _make_option_row(
+                    "SPY", "call", front_exp, "2024-01-20", 100.0, 1.0, 1.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", back_exp, "2024-01-20", 100.0, 3.5, 3.7, 0.30
+                ),
+            ]
+        )
+        entry_dates = pd.DataFrame(
+            {"underlying_symbol": ["SPY"], "quote_date": [pd.Timestamp("2024-01-18")]}
+        )
+        res = op.long_call_calendar(
+            df,
+            front_dte_min=5,
+            front_dte_max=20,
+            back_dte_min=30,
+            back_dte_max=60,
+            exit_dte=7,
+            exit_dte_tolerance=3,
+            entry_dates=entry_dates,
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["exit_date"].iloc[0]) == pd.Timestamp("2024-01-20")
+
+
+class TestStrategyAndSimulatorSecondPassRegressions:
+    """Regression tests for second-pass strategy and simulator bugs."""
+
+    def test_collar_with_stock_exit_dte_tolerance_matches_common_exit(self):
+        """_collar_with_stock must match on a shared exit date within exit_dte_tolerance."""
+        exp = "2024-02-01"
+        options = pd.DataFrame(
+            [
+                # Entry 2024-01-10 (DTE=22): short call strike 110, long put strike 90
+                _make_option_row(
+                    "SPY", "call", exp, "2024-01-10", 110.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "put", exp, "2024-01-10", 90.0, 2.0, 2.2, -0.30
+                ),
+                # Short call has DTE=3 (2024-01-29) AND DTE=1 (2024-01-31)
+                _make_option_row(
+                    "SPY", "call", exp, "2024-01-29", 110.0, 1.0, 1.2, 0.20
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2024-01-31", 110.0, 0.5, 0.7, 0.15
+                ),
+                # Long put only has DTE=3 (2024-01-29)
+                _make_option_row(
+                    "SPY", "put", exp, "2024-01-29", 90.0, 1.5, 1.7, -0.25
+                ),
+            ]
+        )
+        stock = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY", "SPY"],
+                "quote_date": pd.to_datetime(
+                    ["2024-01-10", "2024-01-29", "2024-01-31"]
+                ),
+                "close": [100.0, 102.0, 103.0],
+            }
+        )
+        res = op.collar(
+            options,
+            stock_data=stock,
+            max_entry_dte=45,
+            exit_dte=2,
+            exit_dte_tolerance=2,
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["quote_date_exit"].iloc[0]) == pd.Timestamp(
+            "2024-01-29"
+        )
+
+    def test_normalize_stock_data_drops_nan_and_preserves_single_multiindex_ticker(
+        self,
+    ):
+        """NaN closes must be dropped and single-ticker MultiIndex must retain symbol."""
+        exp = "2024-02-01"
+        options = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", exp, "2024-01-10", 110.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", exp, "2024-02-01", 110.0, 1.0, 1.2, 0.20
+                ),
+                _make_option_row(
+                    "QQQ", "call", exp, "2024-01-10", 210.0, 3.0, 3.2, 0.30
+                ),
+                _make_option_row(
+                    "QQQ", "call", exp, "2024-02-01", 210.0, 1.5, 1.7, 0.20
+                ),
+            ]
+        )
+        # Single-ticker yfinance-style MultiIndex with one NaN close on exit date
+        idx = pd.to_datetime(["2024-01-10", "2024-02-01"])
+        stock_valid = pd.DataFrame(
+            {("Close", "SPY"): [100.0, 105.0]},
+            index=idx,
+        )
+        res = op.covered_call(
+            options, stock_data=stock_valid, max_entry_dte=45, exit_dte=0, raw=True
+        )
+        assert len(res) == 1
+        assert res["underlying_symbol"].iloc[0] == "SPY"
+        assert res["pct_change"].notna().all()
+
+        stock_with_nan = pd.DataFrame(
+            {("Close", "SPY"): [100.0, float("nan")]},
+            index=idx,
+        )
+        res_nan = op.covered_call(
+            options, stock_data=stock_with_nan, max_entry_dte=45, exit_dte=0, raw=True
+        )
+        assert res_nan.empty
+
+    def test_simulate_scales_commission_bound_in_partial(self):
+        """simulate() must scale commission when bound via functools.partial."""
+        from functools import partial
+
+        exp = "2024-02-01"
+        df = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "put", exp, "2024-01-10", 95.0, 2.0, 2.2, -0.30
+                ),
+                _make_option_row(
+                    "SPY", "put", exp, "2024-02-01", 95.0, 0.5, 0.7, -0.10
+                ),
+            ]
+        )
+        sim_kwarg = op.simulate(
+            df,
+            op.short_puts,
+            quantity=5,
+            commission=1.0,
+            max_entry_dte=45,
+            exit_dte=0,
+        )
+        sim_partial = op.simulate(
+            df,
+            partial(op.short_puts, commission=1.0),
+            quantity=5,
+            max_entry_dte=45,
+            exit_dte=0,
+        )
+        assert sim_partial.trade_log["commission"].iloc[0] == pytest.approx(10.0)
+        assert sim_partial.trade_log["realized_pnl"].iloc[0] == pytest.approx(
+            sim_kwarg.trade_log["realized_pnl"].iloc[0]
+        )
+
+    def test_select_nearest_targets_option_leg_for_stock_backed_strategies(self):
+        """selector='nearest' on covered_call(stock_data=...) must pick option delta closest to 0.50."""
+        df = pd.DataFrame(
+            [
+                # Exp 1: option delta 0.20 (further from ATM)
+                _make_option_row(
+                    "SPY", "call", "2024-02-01", "2024-01-10", 115.0, 1.0, 1.2, 0.20
+                ),
+                _make_option_row(
+                    "SPY", "call", "2024-02-01", "2024-02-01", 115.0, 0.5, 0.7, 0.10
+                ),
+                # Exp 2: option delta 0.50 (ATM)
+                _make_option_row(
+                    "SPY", "call", "2024-02-15", "2024-01-10", 100.0, 4.0, 4.2, 0.50
+                ),
+                _make_option_row(
+                    "SPY", "call", "2024-02-15", "2024-02-15", 100.0, 3.0, 3.2, 0.45
+                ),
+            ]
+        )
+        stock = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY", "SPY"],
+                "quote_date": pd.to_datetime(
+                    ["2024-01-10", "2024-02-01", "2024-02-15"]
+                ),
+                "close": [100.0, 102.0, 101.0],
+            }
+        )
+        sim = op.simulate(
+            df,
+            op.covered_call,
+            stock_data=stock,
+            selector="nearest",
+            leg2_delta=_tr(0.35, 0.20),
+            max_entry_dte=45,
+            exit_dte=0,
+        )
+        assert len(sim.trade_log) == 1
+        assert pd.Timestamp(sim.trade_log["expiration"].iloc[0]) == pd.Timestamp(
+            "2024-02-15"
+        )
+
+    def test_simulate_portfolio_rejects_bool_capital_and_truncates_on_ruin(self):
+        """simulate_portfolio must reject bool capital and truncate combined log at ruin."""
+        from optopsy.simulator import SimulationResult, _combine_trade_logs
+
+        with pytest.raises(ValueError, match="capital"):
+            op.simulate_portfolio(
+                legs=[
+                    {
+                        "data": pd.DataFrame(),
+                        "strategy": op.long_calls,
+                        "weight": 1.0,
+                    }
+                ],
+                capital=True,  # type: ignore[arg-type]
+            )
+
+        # Two legs whose combined losses push portfolio equity below zero on trade 1
+        def _sim_res(entry_dt: str, exit_dt: str, pnl: float, cap: float):
+            tl = pd.DataFrame(
+                {
+                    "trade_id": [1],
+                    "underlying_symbol": ["SPY"],
+                    "entry_date": [pd.Timestamp(entry_dt)],
+                    "exit_date": [pd.Timestamp(exit_dt)],
+                    "days_held": [5],
+                    "expiration": [pd.Timestamp(exit_dt)],
+                    "entry_cost": [1.0],
+                    "exit_proceeds": [1.0 + pnl / 100.0],
+                    "quantity": [1],
+                    "multiplier": [100],
+                    "dollar_cost": [100.0],
+                    "dollar_proceeds": [100.0 + pnl],
+                    "commission": [0.0],
+                    "realized_pnl": [pnl],
+                    "pct_change": [pnl / 100.0],
+                    "cumulative_pnl": [pnl],
+                    "equity": [cap + pnl],
+                    "description": ["c 100"],
+                    "exit_type": ["expiration"],
+                }
+            )
+            return SimulationResult(
+                trade_log=tl,
+                equity_curve=tl.set_index("exit_date")["equity"],
+                summary={},
+            )
+
+        combined = _combine_trade_logs(
+            {
+                "leg1": _sim_res("2024-01-01", "2024-01-05", -12_000.0, 5_000.0),
+                "leg2": _sim_res("2024-01-02", "2024-01-10", -4_000.0, 5_000.0),
+            },
+            capital=10_000.0,
+        )
+        # Must truncate at leg1's ruin trade rather than keeping leg2 on negative equity
+        assert len(combined) == 1
+        assert combined["equity"].iloc[0] == pytest.approx(-2_000.0)
+
+    def test_simulate_portfolio_equity_curve_agrees_with_log_on_ruin(self):
+        """Public simulate_portfolio() equity_curve must stop at ruin and match trade_log/summary,
+        including when multiple trades close on the ruin date."""
+        # Leg A: loses $1,500 on 2024-01-10 (pushes $1,000 portfolio to -$500)
+        leg_a_data = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", "2024-01-10", "2024-01-02", 100.0, 20.0, 20.0, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", "2024-01-10", "2024-01-10", 100.0, 5.0, 5.0, 0.10
+                ),
+            ]
+        )
+        # Leg B: also closes on 2024-01-10 (loses $200) AND has a later trade on 2024-01-25 (+$300)
+        leg_b_data = pd.DataFrame(
+            [
+                _make_option_row(
+                    "QQQ", "call", "2024-01-10", "2024-01-02", 100.0, 5.0, 5.0, 0.30
+                ),
+                _make_option_row(
+                    "QQQ", "call", "2024-01-10", "2024-01-10", 100.0, 3.0, 3.0, 0.10
+                ),
+                _make_option_row(
+                    "QQQ", "call", "2024-01-25", "2024-01-12", 100.0, 2.0, 2.0, 0.30
+                ),
+                _make_option_row(
+                    "QQQ", "call", "2024-01-25", "2024-01-25", 100.0, 5.0, 5.0, 0.50
+                ),
+            ]
+        )
+        res = op.simulate_portfolio(
+            legs=[
+                {
+                    "name": "leg_a",
+                    "data": leg_a_data,
+                    "strategy": op.long_calls,
+                    "weight": 0.5,
+                    "slippage": "mid",
+                    "max_entry_dte": 30,
+                    "exit_dte": 0,
+                },
+                {
+                    "name": "leg_b",
+                    "data": leg_b_data,
+                    "strategy": op.long_calls,
+                    "weight": 0.5,
+                    "slippage": "mid",
+                    "max_entry_dte": 30,
+                    "exit_dte": 0,
+                },
+            ],
+            capital=1_000.0,
+        )
+        # leg_a closes first on 2024-01-10 (deterministic leg tie-breaker) and ruins portfolio
+        assert len(res.trade_log) == 1
+        assert res.trade_log["equity"].iloc[-1] == pytest.approx(-500.0)
+        assert res.summary["total_pnl"] == pytest.approx(-1_500.0)
+        # Equity curve must end on the ruin date and match trade_log / summary
+        assert res.equity_curve.index.max() == pd.Timestamp("2024-01-10")
+        assert res.equity_curve.iloc[-1] == pytest.approx(
+            res.trade_log["equity"].iloc[-1]
+        )
+
+    def test_simulate_portfolio_intraday_exit_aggregates_into_daily_equity(self):
+        """Intraday exit timestamps must aggregate into daily bins without producing NaN."""
+
+        def intraday_strategy(_data, **_kwargs):
+            return pd.DataFrame(
+                {
+                    "underlying_symbol": ["SPY"],
+                    "quote_date_entry": [pd.Timestamp("2024-01-02 09:30:00")],
+                    "quote_date_exit": [pd.Timestamp("2024-01-10 16:00:00")],
+                    "option_type": ["call"],
+                    "expiration": [pd.Timestamp("2024-01-19")],
+                    "dte_entry": [17],
+                    "strike": [100.0],
+                    "entry": [2.0],
+                    "exit": [3.5],
+                    "pct_change": [0.75],
+                    "delta_entry": [0.30],
+                }
+            )
+
+        res = op.simulate_portfolio(
+            legs=[
+                {
+                    "name": "intraday",
+                    "data": pd.DataFrame({"x": [1]}),
+                    "strategy": intraday_strategy,
+                    "weight": 1.0,
+                }
+            ],
+            capital=10_000.0,
+        )
+        assert not res.equity_curve.isna().any()
+        assert len(res.equity_curve) == 1
+        assert res.equity_curve.index[0] == pd.Timestamp("2024-01-10")
+        assert res.equity_curve.iloc[0] == pytest.approx(
+            res.trade_log["equity"].iloc[-1]
+        )
+
+    def test_diagonal_enforces_distinct_strikes_and_uses_distinct_default_deltas(
+        self, calendar_data
+    ):
+        """Diagonal spreads must enforce strike_leg1 != strike_leg2 and default leg2 to ATM."""
+        call_diag = op.long_call_diagonal(
+            calendar_data,
+            front_dte_min=20,
+            front_dte_max=40,
+            back_dte_min=50,
+            back_dte_max=70,
+            exit_dte=7,
+            raw=True,
+        )
+        assert len(call_diag) == 1
+        assert call_diag["strike_leg1"].iloc[0] == pytest.approx(215.0)
+        assert call_diag["strike_leg2"].iloc[0] == pytest.approx(212.5)
+        assert (call_diag["strike_leg1"] != call_diag["strike_leg2"]).all()
+
+        put_diag = op.long_put_diagonal(
+            calendar_data,
+            front_dte_min=20,
+            front_dte_max=40,
+            back_dte_min=50,
+            back_dte_max=70,
+            exit_dte=7,
+            raw=True,
+        )
+        assert len(put_diag) == 1
+        assert put_diag["strike_leg1"].iloc[0] == pytest.approx(210.0)
+        assert put_diag["strike_leg2"].iloc[0] == pytest.approx(212.5)
+        assert (put_diag["strike_leg1"] != put_diag["strike_leg2"]).all()
+
+        # Explicitly forcing both legs to the same strike must be filtered out
+        same_strike_diag = op.long_call_diagonal(
+            calendar_data,
+            front_dte_min=20,
+            front_dte_max=40,
+            back_dte_min=50,
+            back_dte_max=70,
+            exit_dte=7,
+            leg1_delta=_tr(0.35),
+            leg2_delta=_tr(0.38),
+            raw=True,
+        )
+        assert same_strike_diag.empty
+
+
+class TestSignalsSecondPassRegressions:
+    """Regression tests for second-pass signal bugs."""
+
+    def _make_ohlcv(self, n: int = 60, descending: bool = False) -> pd.DataFrame:
+        rng = np.random.default_rng(42)
+        dates = pd.date_range("2024-01-01", periods=n, freq="B")
+        close = 100.0 + np.cumsum(rng.normal(0.05, 1.37, size=n))
+        high = close + rng.uniform(0.31, 1.73, size=n)
+        low = close - rng.uniform(0.29, 1.67, size=n)
+        volume = rng.integers(100_001, 999_999, size=n).astype(float) + 0.25
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": "SPY",
+                "quote_date": dates,
+                "open": close,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+            }
+        )
+        if descending:
+            df = df.iloc[::-1].reset_index(drop=True)
+        return df
+
+    def test_mfi_works_on_realistic_float_ohlcv_under_pandas_3(self):
+        """mfi_above and mfi_below must compute exact float64 MFI values without pandas 3.0 TypeError."""
+        from optopsy.signals.volume import _compute_mfi
+
+        # 1. Realistic float OHLCV smoke check
+        df = self._make_ohlcv(50)
+        above = op.mfi_above(period=14, threshold=70)(df)
+        below = op.mfi_below(period=14, threshold=30)(df)
+        assert above.dtype == bool and len(above) == 50
+        assert below.dtype == bool and len(below) == 50
+        assert not above.iloc[:14].any()
+        assert not below.iloc[:14].any()
+
+        def _make_tp_df(tps: list[float], vols: list[float]) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "underlying_symbol": "SPY",
+                    "quote_date": pd.date_range(
+                        "2024-01-01", periods=len(tps), freq="B"
+                    ),
+                    "high": [tp + 0.3 for tp in tps],
+                    "low": [tp - 0.3 for tp in tps],
+                    "close": tps,
+                    "volume": vols,
+                }
+            )
+
+        # 2. Deterministic mixed flow (period=3):
+        #    TP  = [10.0, 11.0 (+), 10.5 (-), 12.0 (+), 9.0 (-)]
+        #    Vol = [100.5, 200.5,   100.5,    300.5,    500.5]
+        #    Bar 3 window (bars 1,2,3):
+        #      pos = 11.0*200.5 + 12.0*300.5 = 2205.5 + 3606.0 = 5811.5
+        #      neg = 10.5*100.5 = 1055.25
+        #      MFI[3] = 100 * 5811.5 / (5811.5 + 1055.25) = 84.632467...
+        #    Bar 4 window (bars 2,3,4):
+        #      pos = 12.0*300.5 = 3606.0
+        #      neg = 10.5*100.5 + 9.0*500.5 = 1055.25 + 4504.5 = 5559.75
+        #      MFI[4] = 100 * 3606.0 / (3606.0 + 5559.75) = 39.342116...
+        mixed_df = _make_tp_df(
+            [10.0, 11.0, 10.5, 12.0, 9.0],
+            [100.5, 200.5, 100.5, 300.5, 500.5],
+        )
+        mfi_vals = _compute_mfi(
+            mixed_df["high"], mixed_df["low"], mixed_df["close"], mixed_df["volume"], 3
+        )
+        assert mfi_vals is not None
+        assert mfi_vals.iloc[:3].isna().all()
+        assert mfi_vals.iloc[3] == pytest.approx(100.0 * 5811.5 / (5811.5 + 1055.25))
+        assert mfi_vals.iloc[4] == pytest.approx(100.0 * 3606.0 / (3606.0 + 5559.75))
+        assert op.mfi_above(period=3, threshold=80)(mixed_df).tolist() == [
+            False,
+            False,
+            False,
+            True,
+            False,
+        ]
+        assert op.mfi_below(period=3, threshold=40)(mixed_df).tolist() == [
+            False,
+            False,
+            False,
+            False,
+            True,
+        ]
+
+        # 3. Positive-only flow -> MFI == 100.0
+        pos_df = _make_tp_df([10.0, 11.0, 12.0, 13.0, 14.0], [100.5] * 5)
+        pos_mfi = _compute_mfi(
+            pos_df["high"], pos_df["low"], pos_df["close"], pos_df["volume"], 3
+        )
+        assert pos_mfi is not None
+        assert pos_mfi.iloc[3:].tolist() == pytest.approx([100.0, 100.0])
+        assert op.mfi_above(period=3, threshold=80)(pos_df).tolist() == [
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]
+        assert not op.mfi_below(period=3, threshold=20)(pos_df).any()
+
+        # 4. Negative-only flow -> MFI == 0.0
+        neg_df = _make_tp_df([14.0, 13.0, 12.0, 11.0, 10.0], [100.5] * 5)
+        neg_mfi = _compute_mfi(
+            neg_df["high"], neg_df["low"], neg_df["close"], neg_df["volume"], 3
+        )
+        assert neg_mfi is not None
+        assert neg_mfi.iloc[3:].tolist() == pytest.approx([0.0, 0.0])
+        assert op.mfi_below(period=3, threshold=20)(neg_df).tolist() == [
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]
+        assert not op.mfi_above(period=3, threshold=80)(neg_df).any()
+
+        # 5. Zero-flow (flat TP) -> MFI is NaN, both signals False
+        flat_df = _make_tp_df([10.0] * 5, [100.5] * 5)
+        flat_mfi = _compute_mfi(
+            flat_df["high"], flat_df["low"], flat_df["close"], flat_df["volume"], 3
+        )
+        assert flat_mfi is not None
+        assert flat_mfi.isna().all()
+        assert not op.mfi_above(period=3, threshold=0)(flat_df).any()
+        assert not op.mfi_below(period=3, threshold=100)(flat_df).any()
+
+    def test_macd_cross_matches_on_unsorted_descending_dates(self):
+        """Descending quote_date input must match reversed ascending output (no lookahead)."""
+        df_asc = self._make_ohlcv(60, descending=False)
+        df_desc = self._make_ohlcv(60, descending=True)
+
+        asc_above = op.macd_cross_above()(df_asc)
+        desc_above = op.macd_cross_above()(df_desc)
+        assert (
+            desc_above.to_numpy().tolist() == asc_above.iloc[::-1].to_numpy().tolist()
+        )
+
+        asc_below = op.macd_cross_below()(df_asc)
+        desc_below = op.macd_cross_below()(df_desc)
+        assert (
+            desc_below.to_numpy().tolist() == asc_below.iloc[::-1].to_numpy().tolist()
+        )
+
+    def test_macd_stoch_ppo_do_not_crash_on_short_warmup_histories(self):
+        """Warmup-length histories must return all-False rather than raising."""
+        for n in (5, 14, 15, 26, 30, 33):
+            df = self._make_ohlcv(n)
+            assert not op.macd_cross_above()(df).any()
+            assert not op.macd_cross_below()(df).any()
+            assert not op.ppo_cross_above()(df).any()
+            assert not op.ppo_cross_below()(df).any()
+
+        # Default stoch(k=14, d=3, smooth_k=3) requires 14 + 2*3 - 2 = 18 bars
+        for n in (5, 14, 15, 16, 17):
+            df = self._make_ohlcv(n)
+            assert not op.stoch_below()(df).any()
+            assert not op.stoch_above()(df).any()
+        # At 18 bars (exact threshold), ta.stoch succeeds without raising
+        df_18 = self._make_ohlcv(18)
+        assert len(op.stoch_below()(df_18)) == 18
+        assert len(op.stoch_above()(df_18)) == 18
+
+        # Non-default stoch(k=14, d=5, smooth_k=5) requires 14 + 2*5 - 2 = 22 bars
+        for n in (18, 20, 21):
+            df = self._make_ohlcv(n)
+            assert not op.stoch_below(k_period=14, d_period=5)(df).any()
+            assert not op.stoch_above(k_period=14, d_period=5)(df).any()
+        df_22 = self._make_ohlcv(22)
+        assert len(op.stoch_below(k_period=14, d_period=5)(df_22)) == 22
+        assert len(op.stoch_above(k_period=14, d_period=5)(df_22)) == 22
+
+    def test_custom_signal_accepts_string_and_date_quote_date(self):
+        """custom_signal must coerce string and datetime.date quote_date columns."""
+        import datetime
+
+        sig_df = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY"],
+                "quote_date": ["2024-01-02", "2024-01-03"],
+                "signal": [True, False],
+            }
+        )
+        sig = op.custom_signal(sig_df)
+        target = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY"],
+                "quote_date": [datetime.date(2024, 1, 2), datetime.date(2024, 1, 3)],
+            }
+        )
+        out = sig(target)
+        assert out.tolist() == [True, False]
+
+    def test_stochrsi_and_ppo_accept_float_periods_and_swapped_fast_slow(self):
+        """stochrsi_* and ppo_cross_* must coerce float periods and match swapped columns."""
+        df = self._make_ohlcv(80)
+        res_sr = op.stochrsi_below(14.0, 14.0, 3.0, 3.0, 20)(df)  # type: ignore[arg-type]
+        assert res_sr.dtype == bool and len(res_sr) == 80
+
+        res_ppo_float = op.ppo_cross_above(12.0, 26.0, 9.0)(df)  # type: ignore[arg-type]
+        res_ppo_int = op.ppo_cross_above(12, 26, 9)(df)
+        assert res_ppo_float.tolist() == res_ppo_int.tolist()
+
+        res_ppo_swapped = op.ppo_cross_above(26, 12, 9)(df)
+        assert res_ppo_swapped.tolist() == res_ppo_int.tolist()
+
+    def test_sustained_preserves_non_monotonic_index_labels_for_user_callbacks(self):
+        """sustained() must preserve non-monotonic index labels for user-defined callbacks."""
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY", "SPY"],
+                "quote_date": pd.to_datetime(
+                    ["2024-01-02", "2024-01-03", "2024-01-04"]
+                ),
+                "close": [100.0, 101.0, 102.0],
+            },
+            index=[20, 10, 30],
+        )
+        external_flags = pd.Series({20: False, 10: True, 30: True})
+        seen_indices: list[list[int]] = []
+
+        def lookup_callback(g: pd.DataFrame) -> "pd.Series[bool]":
+            seen_indices.append(g.index.tolist())
+            return external_flags.loc[g.index]
+
+        out = sustained(lookup_callback, days=2)(df)
+        assert seen_indices == [[20, 10, 30]]
+        assert out.index.tolist() == [20, 10, 30]
+        assert out.tolist() == [False, False, True]

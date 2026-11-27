@@ -11,6 +11,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from .timestamps import normalize_dates
+
 
 def _assign_dte(data: pd.DataFrame) -> pd.DataFrame:
     """Assign days to expiration (DTE) to the dataset."""
@@ -58,22 +60,26 @@ def _apply_signal_filter(
     """
     Filter data to only include rows matching valid (symbol, date) pairs.
 
-    Both the option chain data (normalized at the root of _process_strategy /
-    _process_calendar_strategy) and signal dates (normalized in signal_dates)
-    are already date-only, so this is a straightforward inner join.
+    Normalizes ``valid_dates["quote_date"]`` to date-only tz-naive timestamps,
+    drops duplicate ``(underlying_symbol, quote_date)`` pairs, and selects only
+    the join key columns so extra columns in caller-supplied DataFrames cannot
+    cause suffix collisions or duplicate rows.
 
     Args:
         data: DataFrame to filter (already date-normalized)
-        valid_dates: DataFrame with (underlying_symbol, quote_date) of valid dates
-            (already date-normalized via signal_dates)
+        valid_dates: DataFrame with at least (underlying_symbol, quote_date)
+            of valid dates
         date_col: Name of the date column in data to match against (default: quote_date)
 
     Returns:
         Filtered DataFrame
     """
+    keys = valid_dates[["underlying_symbol", "quote_date"]].copy()
+    keys["quote_date"] = normalize_dates(pd.to_datetime(keys["quote_date"]))
+    keys = keys.drop_duplicates(subset=["underlying_symbol", "quote_date"])
     if date_col != "quote_date":
-        valid_dates = valid_dates.rename(columns={"quote_date": date_col})
-    return data.merge(valid_dates, on=["underlying_symbol", date_col], how="inner")
+        keys = keys.rename(columns={"quote_date": date_col})
+    return data.merge(keys, on=["underlying_symbol", date_col], how="inner")
 
 
 def _select_closest_delta(
@@ -85,7 +91,9 @@ def _select_closest_delta(
     then picks the single closest-to-target row per
     (underlying_symbol, quote_date, expiration, option_type) group.
     """
-    data = data.copy()
+    # Reset index so duplicate input index labels cannot cause .loc[idx] to
+    # return multiple rows per group.
+    data = data.reset_index(drop=True)
     data["_abs_delta"] = data["delta"].abs()
     data = data.loc[
         (data["_abs_delta"] >= delta_min) & (data["_abs_delta"] <= delta_max)

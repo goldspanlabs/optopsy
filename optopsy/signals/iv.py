@@ -38,7 +38,9 @@ def _compute_atm_iv(options_data: pd.DataFrame) -> pd.DataFrame:
         "quote_date",
         "implied_volatility",
     ]
-    df = options_data.dropna(subset=["implied_volatility", "strike", price_col]).copy()
+    df = options_data.dropna(
+        subset=["implied_volatility", "strike", price_col]
+    ).reset_index(drop=True)
     if df.empty:
         return pd.DataFrame(columns=_empty_cols)
 
