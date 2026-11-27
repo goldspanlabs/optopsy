@@ -2602,3 +2602,78 @@ class TestSignalsSecondPassRegressions:
         assert seen_indices == [[20, 10, 30]]
         assert out.index.tolist() == [20, 10, 30]
         assert out.tolist() == [False, False, True]
+
+    def test_options_data_handles_tz_aware_and_intraday_dates_with_bounds(self):
+        """options_data() must normalize tz-aware/intraday dates and bounds inclusively."""
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY"],
+                "option_type": ["call", "call"],
+                "expiration": pd.to_datetime(
+                    ["2024-01-19 16:00:00+00:00", "2024-02-16 16:00:00+00:00"]
+                ),
+                "quote_date": pd.to_datetime(
+                    ["2024-01-02 16:00:00+00:00", "2024-01-02 16:00:00+00:00"]
+                ),
+                "strike": [100.0, 100.0],
+                "bid": [2.0, 4.0],
+                "ask": [2.2, 4.2],
+                "delta": [0.30, 0.35],
+            }
+        )
+        # Naive string bounds against tz-aware intraday expiration (end_date inclusive)
+        trimmed = op.options_data(df, start_date="2024-01-01", end_date="2024-01-19")
+        assert len(trimmed) == 1
+        assert trimmed["expiration"].dt.tz is None
+        assert trimmed["quote_date"].dt.tz is None
+        assert trimmed["expiration"].iloc[0] == pd.Timestamp("2024-01-19")
+
+        # Tz-aware string bounds against naive DataFrame
+        trimmed_tz = op.options_data(
+            trimmed,
+            start_date="2024-01-19T16:00:00+00:00",
+            end_date="2024-01-19T23:59:59+00:00",
+        )
+        assert len(trimmed_tz) == 1
+
+    def test_early_exits_deduplicates_duplicate_intermediate_quotes(self):
+        """_get_intermediate_snapshots must deduplicate duplicate quotes per contract/date."""
+        from optopsy.exits import _get_intermediate_snapshots
+
+        data = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", "2024-02-01", "2024-01-02", 100.0, 5.0, 5.2, 0.50
+                ),
+                # Two duplicate rows for the same contract on 2024-01-10
+                _make_option_row(
+                    "SPY", "call", "2024-02-01", "2024-01-10", 100.0, 6.0, 6.2, 0.55
+                ),
+                _make_option_row(
+                    "SPY", "call", "2024-02-01", "2024-01-10", 100.0, 1.0, 1.2, 0.20
+                ),
+                _make_option_row(
+                    "SPY", "call", "2024-02-01", "2024-02-01", 100.0, 7.0, 7.2, 0.60
+                ),
+            ]
+        )
+        trades = pd.DataFrame(
+            {
+                "_trade_id": [0],
+                "underlying_symbol": ["SPY"],
+                "option_type": ["call"],
+                "expiration": [pd.Timestamp("2024-02-01")],
+                "strike": [100.0],
+                "quote_date_entry": [pd.Timestamp("2024-01-02")],
+                "quote_date_exit": [pd.Timestamp("2024-02-01")],
+            }
+        )
+        snaps = _get_intermediate_snapshots(
+            data,
+            trades,
+            ["underlying_symbol", "option_type", "expiration", "strike"],
+            "quote_date_entry",
+            exit_date_col="quote_date_exit",
+        )
+        assert len(snaps) == 1
+        assert snaps["_mid"].iloc[0] == pytest.approx(6.1)
