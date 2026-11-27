@@ -228,12 +228,22 @@ def _normalise_trades(
         ),
         None,
     )
+    fallback_exit = (
+        pd.to_datetime(df["expiration"] - pd.Timedelta(days=exit_dte))
+        if exit_dte > 0
+        else pd.to_datetime(df["exit_date"])
+    )
     if explicit_exit_col is not None:
-        base_exit = pd.to_datetime(raw[explicit_exit_col].to_numpy())
-    elif exit_dte > 0:
-        base_exit = pd.to_datetime(df["expiration"] - pd.Timedelta(days=exit_dte))
+        matched_exit = pd.to_datetime(raw[explicit_exit_col].to_numpy())
+        base_exit = pd.to_datetime(
+            np.where(
+                pd.notna(matched_exit),
+                matched_exit.to_numpy(),
+                fallback_exit.to_numpy(),
+            )
+        )
     else:
-        base_exit = pd.to_datetime(df["exit_date"])
+        base_exit = fallback_exit
 
     if "_early_exit_date" in raw.columns:
         early = pd.to_datetime(raw["_early_exit_date"].to_numpy())

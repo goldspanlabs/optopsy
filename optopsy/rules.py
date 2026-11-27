@@ -69,7 +69,7 @@ def _rule_butterfly_strikes(data: pd.DataFrame, leg_def: List[Tuple]) -> pd.Data
     mask = (
         (data["strike_leg1"] < data["strike_leg2"])
         & (data["strike_leg2"] < data["strike_leg3"])
-        & np.isclose(left_wing, right_wing, atol=1e-6)
+        & np.isclose(left_wing, right_wing, rtol=0.0, atol=1e-6)
     )
     return data[mask]
 

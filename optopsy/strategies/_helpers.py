@@ -10,6 +10,7 @@ pass raw user ``kwargs`` through to ``_process_strategy()`` /
 ``_process_calendar_strategy()``, which validate and apply defaults.
 """
 
+import inspect
 from enum import Enum
 from typing import List, Optional, Tuple, Unpack
 
@@ -278,8 +279,12 @@ def _normalize_stock_data(
         tickers = df.columns.get_level_values(-1).unique()
         non_empty_tickers = [t for t in tickers if t != ""]
         if len(non_empty_tickers) > 1:
-            # Multi-ticker yfinance DataFrame: stack ticker level into rows
-            df = df.stack(level=-1, future_stack=True).reset_index()
+            # Multi-ticker yfinance DataFrame: stack ticker level into rows.
+            # future_stack was added in pandas 2.1; fall back for pandas 2.0.
+            if "future_stack" in inspect.signature(df.stack).parameters:
+                df = df.stack(level=-1, future_stack=True).reset_index()
+            else:
+                df = df.stack(level=-1).reset_index()
             # Rename stacked ticker column to underlying_symbol
             if "Ticker" in df.columns:
                 df = df.rename(columns={"Ticker": "underlying_symbol"})
@@ -537,6 +542,7 @@ def _covered_with_stock(
             "underlying_symbol": result["underlying_symbol"].values,
             "underlying_price_entry_leg1": result["_stock_entry"].values,
             "expiration": result["expiration"].values,
+            "quote_date_exit": result["quote_date_exit"].values,
             "dte_entry": result["dte_entry"].values,
             "option_type_leg1": "stock",
             "strike_leg1": result["_stock_entry"].values,
@@ -744,6 +750,7 @@ def _collar_with_stock(
             "underlying_symbol": result["underlying_symbol"].values,
             "underlying_price_entry_leg1": result["_stock_entry"].values,
             "expiration": result["expiration"].values,
+            "quote_date_exit": result["quote_date_exit"].values,
             "dte_entry": result["dte_entry"].values,
             "dte_range": (
                 result["dte_range"].values if "dte_range" in result.columns else np.nan

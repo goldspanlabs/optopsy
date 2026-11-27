@@ -318,5 +318,7 @@ def compute_risk_metrics(
 
 def _to_array(data: _ArrayLike) -> np.ndarray:
     """Convert input to a flat float numpy array, dropping NaNs."""
+    if isinstance(data, pd.Series):
+        data = data.dropna()
     arr = np.asarray(data, dtype=float)
     return arr[~np.isnan(arr)]

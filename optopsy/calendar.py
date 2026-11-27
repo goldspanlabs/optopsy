@@ -222,42 +222,61 @@ def _find_calendar_exit_prices(
         # Exact date matching (original behavior)
         exit_data = exit_pool[exit_pool["quote_date"].isin(all_exit_dates)]
     else:
-        # Tolerance-based matching: snap each target exit_date to the
-        # closest available quote_date within tolerance using vectorized
-        # searchsorted instead of a Python loop.
+        # Tolerance-based matching: snap each (underlying_symbol, target exit_date)
+        # independently so one symbol's dates cannot shadow another symbol's exit.
         tolerance_td = np.timedelta64(exit_dte_tolerance, "D")
-        available_dates = np.sort(exit_pool["quote_date"].unique())
+        snapped_rows: list[tuple[Any, Any, Any]] = []
 
-        if len(available_dates) == 0:
+        avail_by_sym = {
+            sym: np.sort(grp["quote_date"].unique())
+            for sym, grp in exit_pool.groupby("underlying_symbol", sort=False)
+        }
+
+        for sym, sym_targets_series in merged.groupby("underlying_symbol", sort=False)[
+            "exit_date"
+        ]:
+            available_dates = avail_by_sym.get(sym)
+            if available_dates is None or len(available_dates) == 0:
+                continue
+
+            targets = np.asarray(
+                sym_targets_series.unique(), dtype=available_dates.dtype
+            )
+            idx = np.searchsorted(available_dates, targets, side="left")
+            idx = np.clip(idx, 0, len(available_dates) - 1)
+
+            left = np.clip(idx - 1, 0, len(available_dates) - 1)
+            right = np.clip(idx, 0, len(available_dates) - 1)
+            diff_left = np.abs(available_dates[left] - targets)
+            diff_right = np.abs(available_dates[right] - targets)
+            nearest_idx = np.where(diff_left <= diff_right, left, right)
+            nearest_dates = available_dates[nearest_idx]
+            nearest_diffs = np.abs(nearest_dates - targets)
+
+            within = nearest_diffs <= tolerance_td
+            for target_dt, snapped_dt in zip(targets[within], nearest_dates[within]):
+                snapped_rows.append((sym, target_dt, snapped_dt))
+
+        if not snapped_rows:
             return merged.iloc[:0]
 
-        targets = np.asarray(all_exit_dates, dtype=available_dates.dtype)
-
-        # searchsorted finds the insertion point; check both neighbors
-        # to find the closest available date for each target.
-        idx = np.searchsorted(available_dates, targets, side="left")
-        idx = np.clip(idx, 0, len(available_dates) - 1)
-
-        # Compare left and right neighbors to find the nearest
-        left = np.clip(idx - 1, 0, len(available_dates) - 1)
-        right = np.clip(idx, 0, len(available_dates) - 1)
-        diff_left = np.abs(available_dates[left] - targets)
-        diff_right = np.abs(available_dates[right] - targets)
-        nearest_idx = np.where(diff_left <= diff_right, left, right)
-        nearest_dates = available_dates[nearest_idx]
-        nearest_diffs = np.abs(nearest_dates - targets)
-
-        # Build mapping only for targets within tolerance
-        within = nearest_diffs <= tolerance_td
-        date_map = dict(zip(targets[within], nearest_dates[within]))
-
-        if not date_map:
-            return merged.iloc[:0]
-
-        merged["exit_date"] = (
-            merged["exit_date"].map(date_map).fillna(merged["exit_date"])
+        snap_df = pd.DataFrame(
+            snapped_rows,
+            columns=["underlying_symbol", "exit_date", "_snapped_exit_date"],
         )
-        exit_data = exit_pool[exit_pool["quote_date"].isin(date_map.values())]
+        merged = (
+            merged.merge(snap_df, on=["underlying_symbol", "exit_date"], how="inner")
+            .drop(columns=["exit_date"])
+            .rename(columns={"_snapped_exit_date": "exit_date"})
+        )
+        exit_keys = (
+            snap_df[["underlying_symbol", "_snapped_exit_date"]]
+            .rename(columns={"_snapped_exit_date": "quote_date"})
+            .drop_duplicates()
+        )
+        exit_data = exit_pool.merge(
+            exit_keys, on=["underlying_symbol", "quote_date"], how="inner"
+        )
 
     # Never allow exit on or before entry date (prevents look-backward trades)
     merged = merged[merged["exit_date"] > merged["quote_date"]]

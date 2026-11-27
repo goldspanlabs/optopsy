@@ -34,7 +34,9 @@ from optopsy.signals import (
     psar_buy,
     psar_sell,
     rally_from_low,
+    signal,
     signal_dates,
+    sma_above,
     smi_cross_above,
     squeeze_off,
     squeeze_on,
@@ -1093,6 +1095,152 @@ class TestSimulatorRegressions:
         assert _select_highest_premium(group).name == 0
         assert _select_lowest_premium(group).name == 0
 
+    def test_matched_exit_date_preserved_in_simulate_and_portfolio(self):
+        """Matched tolerance exit dates must flow into both simulate and simulate_portfolio."""
+        exp = "2020-01-20"
+        df = pd.DataFrame(
+            [
+                # AAA: enters Jan 2 at $1.50, only exit quote is Jan 16 (DTE=4) at $0.30
+                _make_option_row(
+                    "AAA", "call", exp, "2020-01-02", 100.0, 1.50, 1.50, 0.30
+                ),
+                _make_option_row(
+                    "AAA", "call", exp, "2020-01-16", 100.0, 0.30, 0.30, 0.10
+                ),
+                # BBB: enters Jan 4 at $1.50, exit quote is Jan 15 (DTE=5) at $2.00
+                _make_option_row(
+                    "BBB", "call", exp, "2020-01-04", 100.0, 1.50, 1.50, 0.30
+                ),
+                _make_option_row(
+                    "BBB", "call", exp, "2020-01-15", 100.0, 2.00, 2.00, 0.50
+                ),
+            ]
+        )
+
+        sim = op.simulate(
+            df,
+            op.long_calls,
+            capital=100.0,
+            quantity=1,
+            max_positions=2,
+            multiplier=100,
+            exit_dte=5,
+            exit_dte_tolerance=1,
+            slippage="mid",
+        )
+        port = op.simulate_portfolio(
+            [
+                {
+                    "data": df,
+                    "strategy": op.long_calls,
+                    "weight": 1.0,
+                    "quantity": 1,
+                    "max_positions": 2,
+                    "multiplier": 100,
+                    "exit_dte": 5,
+                    "exit_dte_tolerance": 1,
+                    "slippage": "mid",
+                }
+            ],
+            capital=100.0,
+        )
+
+        for result in (sim, port):
+            log = result.trade_log
+            assert len(log) == 2
+            assert list(log["underlying_symbol"]) == ["BBB", "AAA"]
+            assert list(pd.to_datetime(log["exit_date"])) == [
+                pd.Timestamp("2020-01-15"),
+                pd.Timestamp("2020-01-16"),
+            ]
+            assert list(log["equity"]) == pytest.approx([150.0, 30.0])
+
+    def test_early_exit_takes_precedence_over_matched_exit_date(self):
+        """Explicit early-exit dates must override matched tolerance exit dates."""
+        exp = "2020-01-20"
+        df = pd.DataFrame(
+            [
+                # AAA: enters Jan 2 at $2.00, stops out Jan 10 at $0.50 (-75%), matched exit Jan 16
+                _make_option_row(
+                    "AAA", "call", exp, "2020-01-02", 100.0, 2.00, 2.00, 0.30
+                ),
+                _make_option_row(
+                    "AAA", "call", exp, "2020-01-10", 100.0, 0.50, 0.50, 0.15
+                ),
+                _make_option_row(
+                    "AAA", "call", exp, "2020-01-16", 100.0, 1.80, 1.80, 0.25
+                ),
+                # BBB: enters Jan 4 at $2.00, no stop on Jan 10 ($2.10), exits on matched Jan 16 ($2.40)
+                _make_option_row(
+                    "BBB", "call", exp, "2020-01-04", 100.0, 2.00, 2.00, 0.30
+                ),
+                _make_option_row(
+                    "BBB", "call", exp, "2020-01-10", 100.0, 2.10, 2.10, 0.35
+                ),
+                _make_option_row(
+                    "BBB", "call", exp, "2020-01-16", 100.0, 2.40, 2.40, 0.45
+                ),
+            ]
+        )
+        entry_dates = pd.DataFrame(
+            {
+                "underlying_symbol": ["AAA", "BBB"],
+                "quote_date": pd.to_datetime(["2020-01-02", "2020-01-04"]),
+            }
+        )
+        sim = op.simulate(
+            df,
+            op.long_calls,
+            capital=10_000.0,
+            quantity=1,
+            max_positions=2,
+            multiplier=100,
+            exit_dte=5,
+            exit_dte_tolerance=1,
+            entry_dates=entry_dates,
+            stop_loss=-0.50,
+            slippage="mid",
+        )
+        log = sim.trade_log
+        assert len(log) == 2
+        assert list(log["underlying_symbol"]) == ["AAA", "BBB"]
+        assert list(pd.to_datetime(log["exit_date"])) == [
+            pd.Timestamp("2020-01-10"),
+            pd.Timestamp("2020-01-16"),
+        ]
+        assert list(log["exit_type"]) == ["stop_loss", "expiration"]
+
+    def test_custom_strategy_without_matched_exit_date_uses_fallback(self):
+        """Custom strategies omitting matched exit dates must keep the expiration - exit_dte fallback."""
+
+        def _custom_strategy(_data: pd.DataFrame, *, raw: bool = True, **_kwargs):
+            assert raw is True
+            return pd.DataFrame(
+                {
+                    "underlying_symbol": ["AAA"],
+                    "quote_date_entry": [pd.Timestamp("2020-01-02")],
+                    "option_type": ["call"],
+                    "expiration": [pd.Timestamp("2020-01-20")],
+                    "dte_entry": [18],
+                    "strike": [100.0],
+                    "entry": [1.50],
+                    "exit": [2.00],
+                    "pct_change": [1.0 / 3.0],
+                    "delta_entry": [0.30],
+                }
+            )
+
+        dummy = pd.DataFrame({"x": [1]})
+        sim_dte5 = op.simulate(dummy, _custom_strategy, capital=1_000.0, exit_dte=5)
+        assert pd.Timestamp(sim_dte5.trade_log["exit_date"].iloc[0]) == pd.Timestamp(
+            "2020-01-15"
+        )
+
+        sim_dte0 = op.simulate(dummy, _custom_strategy, capital=1_000.0, exit_dte=0)
+        assert pd.Timestamp(sim_dte0.trade_log["exit_date"].iloc[0]) == pd.Timestamp(
+            "2020-01-20"
+        )
+
 
 # =============================================================================
 # 5. Signals Regressions
@@ -1238,3 +1386,139 @@ class TestSignalsRegressions:
             assert len(res) == len(zero_sd)
         assert not daily_return_above(50.0)(zero_sd).iloc[2]
         assert not rally_from_low(period=3, pct=50.0)(zero_sd).iloc[2]
+
+    def test_butterfly_rejects_broken_wing_at_large_strikes(self):
+        """Butterfly rule must use rtol=0.0 so large strikes do not admit broken-wing spreads."""
+        df = pd.DataFrame(
+            {
+                "strike_leg1": [1000.0],
+                "strike_leg2": [2000.0],
+                "strike_leg3": [3000.01],
+            }
+        )
+        filtered = _rule_butterfly_strikes(df, [(1, None), (-1, None), (1, None)])
+        assert filtered.empty
+
+    def test_omega_ratio_object_series_with_pd_na(self):
+        """Object Series containing pd.NA must drop missing entries before float coercion."""
+        returns = pd.Series([0.01, pd.NA, -0.005, 0.02], dtype=object)
+        val = omega_ratio(returns, risk_free_rate=0.0, trading_days=252)
+        assert np.isfinite(val)
+        assert val > 1.0
+
+    def test_calendar_tolerance_snaps_per_symbol(self):
+        """Another symbol's exit date must not shadow a valid tolerance exit for a different symbol."""
+        front_exp = "2020-01-25"
+        back_exp = "2020-02-25"
+        rows = [
+            # SPY entry Jan 10, exit signal only on Jan 16 (front DTE=9)
+            _make_option_row(
+                "SPY", "call", front_exp, "2020-01-10", 100.0, 2.0, 2.2, 0.30
+            ),
+            _make_option_row(
+                "SPY", "call", back_exp, "2020-01-10", 100.0, 4.0, 4.2, 0.30
+            ),
+            _make_option_row(
+                "SPY", "call", front_exp, "2020-01-16", 100.0, 1.0, 1.2, 0.30
+            ),
+            _make_option_row(
+                "SPY", "call", back_exp, "2020-01-16", 100.0, 3.8, 4.0, 0.30
+            ),
+            # QQQ entry Jan 10, exit signal on Jan 18 (front DTE=7, exact target)
+            _make_option_row(
+                "QQQ", "call", front_exp, "2020-01-10", 200.0, 2.0, 2.2, 0.30
+            ),
+            _make_option_row(
+                "QQQ", "call", back_exp, "2020-01-10", 200.0, 4.0, 4.2, 0.30
+            ),
+            _make_option_row(
+                "QQQ", "call", front_exp, "2020-01-18", 200.0, 0.8, 1.0, 0.30
+            ),
+            _make_option_row(
+                "QQQ", "call", back_exp, "2020-01-18", 200.0, 3.9, 4.1, 0.30
+            ),
+        ]
+        df = pd.DataFrame(rows)
+        exit_dates = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "QQQ"],
+                "quote_date": pd.to_datetime(["2020-01-16", "2020-01-18"]),
+            }
+        )
+        res = op.long_call_calendar(
+            df,
+            front_dte_min=10,
+            front_dte_max=20,
+            back_dte_min=30,
+            back_dte_max=60,
+            exit_dte=7,
+            exit_dte_tolerance=3,
+            exit_dates=exit_dates,
+            raw=True,
+        )
+        assert set(res["underlying_symbol"]) == {"SPY", "QQQ"}
+        by_sym = res.set_index("underlying_symbol")["exit_date"]
+        assert pd.Timestamp(by_sym["SPY"]) == pd.Timestamp("2020-01-16")
+        assert pd.Timestamp(by_sym["QQQ"]) == pd.Timestamp("2020-01-18")
+
+    def test_iv_rank_direct_call_normalizes_timestamp_and_tz_aware_dates(self):
+        """Direct iv_rank_above calls with tz-aware market-close timestamps must match ATM keys."""
+        dates = pd.date_range("2020-01-02 16:00:00", periods=20, freq="B", tz="UTC")
+        rows = []
+        for i, d in enumerate(dates):
+            exp = d + pd.Timedelta(days=30)
+            row = _make_option_row(
+                "SPX",
+                "call",
+                exp,
+                d,
+                100.0,
+                4.9,
+                5.1,
+                0.50,
+                implied_volatility=0.15 + 0.01 * i,
+            )
+            row["underlying_price"] = 100.0
+            rows.append(row)
+        opt_df = pd.DataFrame(rows, index=range(100, 100 + len(rows)))
+        mask = iv_rank_above(threshold=0.5, window=10)(opt_df)
+        assert mask.index.equals(opt_df.index)
+        assert mask.any()
+
+    def test_iv_rank_combined_with_historical_price_signal_counts_dates_not_contracts(
+        self,
+    ):
+        """Combining iv_rank_above with sma_above(20) on 10 dates x 5 strikes must NOT warm up SMA."""
+        dates = pd.bdate_range("2020-01-02", periods=10)
+        rows = []
+        for i, d in enumerate(dates):
+            exp = d + pd.Timedelta(days=30)
+            price = 100.0 + i * 2.0
+            for strike in (90.0, 95.0, 100.0, 105.0, 110.0):
+                row = _make_option_row(
+                    "SPX",
+                    "call",
+                    exp,
+                    d,
+                    strike,
+                    4.9,
+                    5.1,
+                    0.50,
+                    implied_volatility=0.15 + 0.02 * i,
+                )
+                row["close"] = price
+                rows.append(row)
+        opt_df = pd.DataFrame(rows)
+
+        combined_fn = and_signals(iv_rank_above(threshold=0.5, window=5), sma_above(20))
+        combined_op = signal(iv_rank_above(threshold=0.5, window=5)) & signal(
+            sma_above(20)
+        )
+        assert signal_dates(opt_df, combined_fn).empty
+        assert signal_dates(opt_df, combined_op).empty
+
+        # Sanity check: with period=5 (<= 10 trading dates), both MUST fire
+        combined_short = and_signals(
+            iv_rank_above(threshold=0.5, window=5), sma_above(5)
+        )
+        assert len(signal_dates(opt_df, combined_short)) > 0

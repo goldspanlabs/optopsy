@@ -15,21 +15,76 @@ def _requires_per_strike(sig: SignalFunc | "Signal") -> bool:
     return bool(getattr(sig, "requires_per_strike", False))
 
 
+def _eval_signal_on_data(
+    sig: SignalFunc | "Signal",
+    data: pd.DataFrame,
+    *,
+    per_strike_context: bool,
+) -> "pd.Series[bool]":
+    """Evaluate *sig* on *data*, deduplicating to 1 row per (symbol, date) for
+    non-per-strike signals when *data* contains multiple option rows per date.
+    """
+    if (
+        not per_strike_context
+        or _requires_per_strike(sig)
+        or data.empty
+        or "underlying_symbol" not in data.columns
+        or "quote_date" not in data.columns
+    ):
+        return sig(data)
+
+    norm_dates = normalize_dates(pd.to_datetime(data["quote_date"]))
+    dedup_keys = pd.DataFrame(
+        {
+            "underlying_symbol": data["underlying_symbol"].values,
+            "_norm_date": norm_dates.values,
+        },
+        index=data.index,
+    )
+    first_mask = ~dedup_keys.duplicated(
+        subset=["underlying_symbol", "_norm_date"], keep="first"
+    )
+    if first_mask.all():
+        return sig(data)
+
+    daily = data.loc[first_mask].copy()
+    daily_norm_dates = norm_dates.loc[first_mask]
+    daily_mask = sig(daily).fillna(False).astype(bool)
+
+    lookup = pd.Series(
+        daily_mask.values,
+        index=pd.MultiIndex.from_arrays(
+            [daily["underlying_symbol"].values, daily_norm_dates.values]
+        ),
+    )
+    keys = pd.MultiIndex.from_arrays(
+        [data["underlying_symbol"].values, norm_dates.values]
+    )
+    return pd.Series(
+        lookup.reindex(keys).fillna(False).values,
+        index=data.index,
+        dtype=bool,
+    )
+
+
 def and_signals(*signals: SignalFunc) -> SignalFunc:
     """Combine multiple signals with logical AND.
 
     All signals must be True for a date to be valid.
     """
+    per_strike = any(_requires_per_strike(s) for s in signals)
 
     def combined(data: pd.DataFrame) -> "pd.Series[bool]":
         result = pd.Series(True, index=data.index)
         for sig in signals:
-            result = result & sig(data)
+            result = result & _eval_signal_on_data(
+                sig, data, per_strike_context=per_strike
+            )
             if not result.any():
                 return result
         return result
 
-    if any(_requires_per_strike(s) for s in signals):
+    if per_strike:
         combined.requires_per_strike = True  # type: ignore[attr-defined]
     return combined
 
@@ -39,16 +94,19 @@ def or_signals(*signals: SignalFunc) -> SignalFunc:
 
     At least one signal must be True for a date to be valid.
     """
+    per_strike = any(_requires_per_strike(s) for s in signals)
 
     def combined(data: pd.DataFrame) -> "pd.Series[bool]":
         result = pd.Series(False, index=data.index)
         for sig in signals:
-            result = result | sig(data)
+            result = result | _eval_signal_on_data(
+                sig, data, per_strike_context=per_strike
+            )
             if result.all():
                 return result
         return result
 
-    if any(_requires_per_strike(s) for s in signals):
+    if per_strike:
         combined.requires_per_strike = True  # type: ignore[attr-defined]
     return combined
 
@@ -83,11 +141,12 @@ def sustained(signal_func: SignalFunc, days: int = 5) -> SignalFunc:
             # Evaluate on full per-strike data, collapse to 1 bool per (symbol, date),
             # compute rolling minimum across consecutive dates, then map back.
             raw = signal_func(data).fillna(False).astype(bool)
+            norm_dates = normalize_dates(pd.to_datetime(data["quote_date"]))
             daily = (
                 pd.DataFrame(
                     {
                         "underlying_symbol": data["underlying_symbol"].values,
-                        "quote_date": data["quote_date"].values,
+                        "quote_date": norm_dates.values,
                         "_flag": raw.values,
                     }
                 )
@@ -106,9 +165,7 @@ def sustained(signal_func: SignalFunc, days: int = 5) -> SignalFunc:
                     [daily["underlying_symbol"], daily["quote_date"]]
                 ),
             )
-            keys = pd.MultiIndex.from_arrays(
-                [data["underlying_symbol"], data["quote_date"]]
-            )
+            keys = pd.MultiIndex.from_arrays([data["underlying_symbol"], norm_dates])
             return pd.Series(
                 lookup.reindex(keys).fillna(False).values,
                 index=data.index,
@@ -177,18 +234,32 @@ class Signal:
         return self._func(data)
 
     def __and__(self, other: "Signal | SignalFunc") -> "Signal":
-        def combined(data: pd.DataFrame) -> "pd.Series[bool]":
-            return self(data) & other(data)
+        per_strike = _requires_per_strike(self) or _requires_per_strike(other)
 
-        if _requires_per_strike(self) or _requires_per_strike(other):
+        def combined(data: pd.DataFrame) -> "pd.Series[bool]":
+            left = _eval_signal_on_data(self, data, per_strike_context=per_strike)
+            if not left.any():
+                return left
+            return left & _eval_signal_on_data(
+                other, data, per_strike_context=per_strike
+            )
+
+        if per_strike:
             combined.requires_per_strike = True  # type: ignore[attr-defined]
         return Signal(combined)
 
     def __or__(self, other: "Signal | SignalFunc") -> "Signal":
-        def combined(data: pd.DataFrame) -> "pd.Series[bool]":
-            return self(data) | other(data)
+        per_strike = _requires_per_strike(self) or _requires_per_strike(other)
 
-        if _requires_per_strike(self) or _requires_per_strike(other):
+        def combined(data: pd.DataFrame) -> "pd.Series[bool]":
+            left = _eval_signal_on_data(self, data, per_strike_context=per_strike)
+            if left.all():
+                return left
+            return left | _eval_signal_on_data(
+                other, data, per_strike_context=per_strike
+            )
+
+        if per_strike:
             combined.requires_per_strike = True  # type: ignore[attr-defined]
         return Signal(combined)
 

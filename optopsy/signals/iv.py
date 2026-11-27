@@ -107,9 +107,8 @@ def _iv_rank_signal(threshold: float, window: int, compare_op) -> SignalFunc:
                 [atm_iv["underlying_symbol"], atm_iv["quote_date"]]
             ),
         )
-        keys = pd.MultiIndex.from_arrays(
-            [data["underlying_symbol"], data["quote_date"]]
-        )
+        norm_dates = normalize_dates(pd.to_datetime(data["quote_date"]))
+        keys = pd.MultiIndex.from_arrays([data["underlying_symbol"], norm_dates])
         iv_rank_for_rows = pd.Series(rank_lookup.reindex(keys).values, index=data.index)
         return compare_op(iv_rank_for_rows, threshold).fillna(False)
 
