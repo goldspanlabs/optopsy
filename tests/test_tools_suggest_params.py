@@ -244,10 +244,21 @@ class TestSuggestStrategyParams:
         assert "leg2_delta" in reco
         assert "leg3_delta" in reco
         assert "leg4_delta" not in reco
-        # ITM wing, ATM body, OTM wing
-        assert reco["leg1_delta"]["target"] == 0.40
+        # ITM wing (0.70), ATM body (0.50), OTM wing (0.30)
+        assert reco["leg1_delta"]["target"] == 0.70
         assert reco["leg2_delta"]["target"] == 0.50
-        assert reco["leg3_delta"]["target"] == 0.10
+        assert reco["leg3_delta"]["target"] == 0.30
+
+        put_result = execute_tool(
+            "suggest_strategy_params",
+            {"strategy_name": "long_put_butterfly"},
+            option_data,
+        )
+        put_reco = _extract_recommended_json(put_result.user_display)
+        assert put_reco is not None
+        assert put_reco["leg1_delta"]["target"] == 0.30
+        assert put_reco["leg2_delta"]["target"] == 0.50
+        assert put_reco["leg3_delta"]["target"] == 0.70
 
     def test_straddle_recommends_atm(self, option_data):
         """Straddle recommends ATM delta for both legs."""
