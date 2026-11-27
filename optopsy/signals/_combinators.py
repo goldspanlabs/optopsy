@@ -172,7 +172,10 @@ def sustained(signal_func: SignalFunc, days: int = 5) -> SignalFunc:
                 dtype=bool,
             )
 
-        raw = signal_func(data).fillna(False).astype(int)
+        raw = pd.Series(
+            signal_func(data).fillna(False).to_numpy(dtype=int),
+            index=range(len(data)),
+        )
 
         def _compute_group(group: pd.DataFrame) -> "pd.Series[bool]":
             return raw.loc[group.index].rolling(days).min().fillna(0).astype(bool)

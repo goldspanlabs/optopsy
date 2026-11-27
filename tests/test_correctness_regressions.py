@@ -43,6 +43,7 @@ from optopsy.signals import (
     stoch_below,
     supertrend_buy,
     supertrend_sell,
+    sustained,
     tsi_cross_above,
 )
 from optopsy.simulator import (
@@ -1522,3 +1523,79 @@ class TestSignalsRegressions:
             iv_rank_above(threshold=0.5, window=5), sma_above(5)
         )
         assert len(signal_dates(opt_df, combined_short)) > 0
+
+    def test_checks_reject_complex_dtype(self):
+        """Schema validation must reject complex-valued numeric columns."""
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPX"],
+                "option_type": ["call"],
+                "expiration": pd.to_datetime(["2020-02-01"]),
+                "quote_date": pd.to_datetime(["2020-01-02"]),
+                "strike": [100.0 + 1j],
+                "bid": [5.0],
+                "ask": [5.2],
+                "delta": [0.30],
+            }
+        )
+        with pytest.raises(ValueError, match="does not match expected types"):
+            _run_checks({}, df)
+
+    def test_unsorted_signals_with_duplicate_index_labels(self):
+        """Unsorted quote_date inputs with duplicate index labels must restore order by position."""
+        closes = [100.0, 102.0, 104.0, 106.0, 108.0]
+        sd_sorted = _make_stock_series(closes)
+        sd_unsorted_dup = sd_sorted.iloc[[3, 1, 4, 0, 2]].copy()
+        sd_unsorted_dup.index = pd.Index([0, 0, 1, 1, 2])
+
+        sig = daily_return_above(1.0)
+        sus = sustained(daily_return_above(1.0), days=2)
+
+        res_sorted = sig(sd_sorted).to_numpy()
+        res_dup = sig(sd_unsorted_dup)
+        assert res_dup.index.equals(sd_unsorted_dup.index)
+        assert list(res_dup.to_numpy()) == [res_sorted[i] for i in [3, 1, 4, 0, 2]]
+
+        sus_sorted = sus(sd_sorted).to_numpy()
+        sus_dup = sus(sd_unsorted_dup)
+        assert sus_dup.index.equals(sd_unsorted_dup.index)
+        assert list(sus_dup.to_numpy()) == [sus_sorted[i] for i in [3, 1, 4, 0, 2]]
+
+    def test_missing_symbol_excluded_from_single_symbol_fast_path(self):
+        """Rows with missing underlying_symbol must not be grouped into the first symbol's fast path."""
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": pd.Series(["SPX", pd.NA], dtype="string"),
+                "quote_date": pd.to_datetime(["2020-01-02", "2020-01-03"]),
+                "close": [100.0, 110.0],
+            }
+        )
+        mask = daily_return_above(5.0)(df)
+        assert list(mask.to_numpy()) == [False, False]
+
+    def test_stock_data_multiindex_unnamed_datetime_index(self):
+        """Multi-ticker yfinance MultiIndex stock_data with unnamed DatetimeIndex must normalize cleanly."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-02", 105.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPX", "call", exp, "2020-02-01", 105.0, 1.0, 1.2, 0.20
+                ),
+            ]
+        )
+        idx = pd.to_datetime(["2020-01-02", "2020-02-01"])  # unnamed DatetimeIndex
+        cols = pd.MultiIndex.from_tuples(
+            [("Close", "SPX"), ("Close", "QQQ"), ("Volume", "SPX"), ("Volume", "QQQ")]
+        )
+        yf_df = pd.DataFrame(
+            [[100.0, 200.0, 1000, 2000], [103.0, 205.0, 1000, 2000]],
+            index=idx,
+            columns=cols,
+        )
+        res = op.covered_call(
+            df, stock_data=yf_df, max_entry_dte=45, exit_dte=0, raw=True
+        )
+        assert len(res) == 1

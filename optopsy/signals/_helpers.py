@@ -30,6 +30,8 @@ def _groupby_symbol(
     if data.empty:
         return pd.Series(False, index=data.index, dtype=bool)
 
+    work = data.reset_index(drop=True)
+
     def _run_sorted(group: pd.DataFrame) -> "pd.Series[bool]":
         if (
             "quote_date" in group.columns
@@ -39,18 +41,20 @@ def _groupby_symbol(
         return compute_group(group)
 
     # Single-symbol fast path avoids groupby/concat overhead
-    symbols = data["underlying_symbol"]
+    symbols = work["underlying_symbol"]
     first = symbols.iloc[0]
-    if pd.notna(first) and (symbols == first).all():
-        res = _run_sorted(data)
-        return res.reindex(data.index, fill_value=False)
+    if pd.notna(first) and bool((symbols == first).fillna(False).all()):
+        res = _run_sorted(work)
+        out = res.reindex(work.index, fill_value=False).to_numpy(dtype=bool)
+        return pd.Series(out, index=data.index, dtype=bool)
 
     parts = [
-        _run_sorted(group) for _, group in data.groupby("underlying_symbol", sort=False)
+        _run_sorted(group) for _, group in work.groupby("underlying_symbol", sort=False)
     ]
     if not parts:
         return pd.Series(False, index=data.index, dtype=bool)
-    return pd.concat(parts).reindex(data.index, fill_value=False)
+    out = pd.concat(parts).reindex(work.index, fill_value=False).to_numpy(dtype=bool)
+    return pd.Series(out, index=data.index, dtype=bool)
 
 
 # ---------------------------------------------------------------------------

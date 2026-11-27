@@ -115,7 +115,10 @@ def _dtype_matches(series: pd.Series, expected: Tuple[str, ...]) -> bool:
         return bool(pd.api.types.is_datetime64_any_dtype(series))
     if any(t in ("int64", "float64") for t in expected):
         return bool(
-            pd.api.types.is_numeric_dtype(series)
+            (
+                pd.api.types.is_integer_dtype(series)
+                or pd.api.types.is_float_dtype(series)
+            )
             and not pd.api.types.is_bool_dtype(series)
         )
     if any(t in ("object", "str") for t in expected):

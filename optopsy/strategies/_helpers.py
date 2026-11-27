@@ -279,6 +279,8 @@ def _normalize_stock_data(
         tickers = df.columns.get_level_values(-1).unique()
         non_empty_tickers = [t for t in tickers if t != ""]
         if len(non_empty_tickers) > 1:
+            if isinstance(df.index, pd.DatetimeIndex) and df.index.name is None:
+                df.index = df.index.rename("date")
             # Multi-ticker yfinance DataFrame: stack ticker level into rows.
             # future_stack was added in pandas 2.1; fall back for pandas 2.0.
             if "future_stack" in inspect.signature(df.stack).parameters:
