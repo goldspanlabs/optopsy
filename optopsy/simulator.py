@@ -681,7 +681,8 @@ def _build_trade_log(
         trade_log["exit_proceeds"] - trade_log["entry_cost"]
     ) * lot_size - trade_log["commission"]
     trade_log["pct_change"] = np.where(
-        trade_log["dollar_cost"] > 0,
+        # Keep strategy-specific return guards (e.g. near-zero calendar entries).
+        trade_log["pct_change"].notna() & (trade_log["dollar_cost"] > 0),
         trade_log["realized_pnl"] / trade_log["dollar_cost"],
         np.nan,
     )

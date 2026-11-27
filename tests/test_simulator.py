@@ -1406,6 +1406,84 @@ class TestSpotCheckCoveredProtective:
 class TestSpotCheckCalendar:
     """Hand-calculated P&L for calendar spreads."""
 
+    @pytest.mark.parametrize(
+        ("strategy", "back_strike"),
+        [(op.long_call_calendar, 100), (op.long_call_diagonal, 105)],
+    )
+    @pytest.mark.parametrize("entry", [0.0, 0.005, -0.005, 0.01, -0.01])
+    @pytest.mark.parametrize("commission", [None, 0.65])
+    @pytest.mark.parametrize(("quantity", "multiplier"), [(1, 100), (3, 10)])
+    def test_near_zero_entry_return_guard(
+        self, strategy, back_strike, entry, commission, quantity, multiplier
+    ):
+        data = pd.DataFrame(
+            [
+                ["TEST", "call", "2026-02-01", "2026-01-01", 100, 1, 1, 0.3],
+                [
+                    "TEST",
+                    "call",
+                    "2026-03-02",
+                    "2026-01-01",
+                    back_strike,
+                    1 + entry,
+                    1 + entry,
+                    0.3,
+                ],
+                ["TEST", "call", "2026-02-01", "2026-01-25", 100, 0.5, 0.5, 0.3],
+                [
+                    "TEST",
+                    "call",
+                    "2026-03-02",
+                    "2026-01-25",
+                    back_strike,
+                    0.6,
+                    0.6,
+                    0.3,
+                ],
+            ],
+            columns=_CHAIN_COLS,
+        )
+        for col in ("expiration", "quote_date"):
+            data[col] = pd.to_datetime(data[col])
+
+        def selector(candidates):
+            if abs(entry) < 0.01:
+                assert candidates["pct_change"].isna().all()
+            else:
+                fee = 0 if commission is None else 4 * commission * quantity
+                expected = ((0.1 - entry) * quantity * multiplier - fee) / (
+                    abs(entry) * quantity * multiplier
+                )
+                assert candidates["pct_change"].iloc[0] == pytest.approx(expected)
+            return candidates.iloc[0]
+
+        result = simulate(
+            data,
+            strategy,
+            selector=selector,
+            slippage="mid",
+            commission=commission,
+            quantity=quantity,
+            multiplier=multiplier,
+        )
+        assert len(result.trade_log) == 1
+        trade = result.trade_log.iloc[0]
+        fee = 0 if commission is None else 4 * commission * quantity
+        pnl = (0.1 - entry) * quantity * multiplier - fee
+        assert trade["commission"] == pytest.approx(fee)
+        assert trade["realized_pnl"] == pytest.approx(pnl)
+        assert trade["equity"] == pytest.approx(100_000 + pnl)
+        assert result.summary["total_pnl"] == pytest.approx(pnl)
+        if abs(entry) < 0.01:
+            assert pd.isna(trade["pct_change"])
+            assert result.summary["var_95"] == 0.0
+            assert result.summary["cvar_95"] == 0.0
+        else:
+            expected = pnl / (abs(entry) * quantity * multiplier)
+            assert trade["pct_change"] == pytest.approx(expected)
+            assert result.summary["var_95"] == pytest.approx(expected)
+            assert result.summary["cvar_95"] == pytest.approx(expected)
+
     def test_long_call_calendar_pnl(self, calendar_data):
         """Long call calendar from ``calendar_data`` (UP, selector=first → strike 215).
 
