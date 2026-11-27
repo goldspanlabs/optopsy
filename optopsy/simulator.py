@@ -118,6 +118,31 @@ def _is_calendar(columns: pd.Index) -> bool:
     return _CALENDAR_MARKER in columns
 
 
+def _scale_commission_for_quantity(commission: Any, quantity: int) -> Any:
+    """Scale per-contract and per-share fees for simulator quantity.
+
+    Base and minimum fees apply once per side of the simulated trade, so they
+    must not be multiplied by the number of contracts.
+    """
+    if commission is None or quantity == 1:
+        return commission
+
+    if isinstance(commission, (int, float)) and not isinstance(commission, bool):
+        return commission * quantity
+
+    if hasattr(commission, "model_dump"):
+        config = commission.model_dump()
+    elif isinstance(commission, dict):
+        config = commission.copy()
+    else:
+        return commission
+
+    for fee in ("per_contract", "per_share"):
+        if fee in config:
+            config[fee] *= quantity
+    return config
+
+
 # ---------------------------------------------------------------------------
 # Trade normalisation
 # ---------------------------------------------------------------------------
@@ -592,7 +617,7 @@ def _build_trade_log(
         return pd.DataFrame(columns=_TRADE_LOG_COLUMNS)
 
     commission = (
-        trades["commission"].fillna(0.0).to_numpy(dtype=float) * quantity
+        trades["commission"].fillna(0.0).to_numpy(dtype=float)
         if "commission" in trades.columns
         else np.zeros(len(trades), dtype=float)
     )
@@ -623,6 +648,11 @@ def _build_trade_log(
     trade_log["realized_pnl"] = (
         trade_log["exit_proceeds"] - trade_log["entry_cost"]
     ) * lot_size - trade_log["commission"]
+    trade_log["pct_change"] = np.where(
+        trade_log["dollar_cost"] > 0,
+        trade_log["realized_pnl"] / trade_log["dollar_cost"],
+        np.nan,
+    )
     trade_log["days_held"] = (
         pd.to_datetime(trade_log["exit_date"]) - pd.to_datetime(trade_log["entry_date"])
     ).dt.days
@@ -699,6 +729,14 @@ def simulate(
         select_fn = _BUILTIN_SELECTORS[selector]
     else:
         select_fn = selector
+
+    # Scale only per-contract and per-share fees for the simulated lot size.
+    # Base/minimum fees remain one charge per side of the simulated trade.
+    strategy_kwargs = strategy_kwargs.copy()
+    if "commission" in strategy_kwargs:
+        strategy_kwargs["commission"] = _scale_commission_for_quantity(
+            strategy_kwargs["commission"], quantity
+        )
 
     # Generate raw trades — return empty result for empty input
     if data.empty:

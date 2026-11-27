@@ -153,6 +153,24 @@ class TestSingleLegStopLoss:
         expected_pct = ((2.90 - 6.10) * 100 - 1.30) / (6.10 * 100)
         assert row["pct_change"] == pytest.approx(expected_pct)
 
+    def test_short_stop_loss_uses_spread_fill_and_commission(self, multi_date_data):
+        result = op.short_calls(
+            multi_date_data,
+            leg1_delta={"target": 0.30, "min": 0.15, "max": 0.40},
+            take_profit=0.20,
+            slippage="spread",
+            commission=0.65,
+            raw=True,
+        )
+
+        row = result.iloc[0]
+        assert row["exit_type"] == "take_profit"
+        assert row["entry"] == pytest.approx(5.90)
+        assert row["exit"] == pytest.approx(4.60)
+        assert row["total_commission"] == pytest.approx(1.30)
+        expected_pct = ((5.90 - 4.60) * 100 - 1.30) / (5.90 * 100)
+        assert row["pct_change"] == pytest.approx(expected_pct)
+
     def test_stop_loss_triggers(self, multi_date_data):
         """Stop-loss should trigger at the first date where P&L <= threshold."""
         result = op.long_calls(
@@ -422,6 +440,52 @@ class TestMaxHoldDaysSingleLeg:
 
 class TestMaxHoldDaysMultiLeg:
     """Test max_hold_days for multi-leg strategies."""
+
+    def test_unequal_leg_quantities_use_spread_fills_and_commission(self):
+        expiration = datetime.datetime(2018, 1, 31)
+        entry_date = datetime.datetime(2018, 1, 1)
+        exit_date = datetime.datetime(2018, 1, 6)
+        data = pd.DataFrame(
+            [
+                ["SPX", "call", expiration, entry_date, 195.0, 9.90, 10.10, 0.70],
+                ["SPX", "call", expiration, entry_date, 200.0, 5.90, 6.10, 0.50],
+                ["SPX", "call", expiration, entry_date, 205.0, 2.90, 3.10, 0.30],
+                ["SPX", "call", expiration, exit_date, 195.0, 7.90, 8.10, 0.65],
+                ["SPX", "call", expiration, exit_date, 200.0, 4.90, 5.10, 0.45],
+                ["SPX", "call", expiration, exit_date, 205.0, 1.90, 2.10, 0.25],
+                ["SPX", "call", expiration, expiration, 195.0, 0.0, 0.10, 0.01],
+                ["SPX", "call", expiration, expiration, 200.0, 0.0, 0.10, 0.01],
+                ["SPX", "call", expiration, expiration, 205.0, 0.0, 0.10, 0.01],
+            ],
+            columns=[
+                "underlying_symbol",
+                "option_type",
+                "expiration",
+                "quote_date",
+                "strike",
+                "bid",
+                "ask",
+                "delta",
+            ],
+        )
+        result = op.long_call_butterfly(
+            data,
+            leg1_delta={"target": 0.70, "min": 0.60, "max": 0.80},
+            leg2_delta={"target": 0.50, "min": 0.40, "max": 0.60},
+            leg3_delta={"target": 0.30, "min": 0.20, "max": 0.40},
+            max_hold_days=5,
+            slippage="spread",
+            commission=0.65,
+            raw=True,
+        )
+
+        row = result.iloc[0]
+        assert row["exit_type"] == "max_hold"
+        assert row["total_entry_cost"] == pytest.approx(1.40)
+        assert row["total_exit_proceeds"] == pytest.approx(-0.40)
+        assert row["total_commission"] == pytest.approx(5.20)
+        expected_pct = (-0.40 - 1.40 - 5.20 / 100) / 1.40
+        assert row["pct_change"] == pytest.approx(expected_pct)
 
     def test_spread_max_hold_days(self, multi_date_spread_data):
         """Multi-leg strategy should exit at max_hold_days."""

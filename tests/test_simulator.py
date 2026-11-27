@@ -10,6 +10,7 @@ import optopsy as op
 from optopsy.simulator import (
     SimulationResult,
     _build_trade_log,
+    _compute_summary,
     _derive_entry_date,
     _filter_trades,
     _find_cost_col,
@@ -22,7 +23,7 @@ from optopsy.simulator import (
     _select_nearest,
     simulate,
 )
-from optopsy.types import TargetRange
+from optopsy.types import Commission, TargetRange
 
 # ---------------------------------------------------------------------------
 # Shared constants
@@ -505,6 +506,66 @@ class TestSimulateSmoke:
         assert trade["commission"] == pytest.approx(1.30)
         assert trade["realized_pnl"] == pytest.approx(expected_pnl)
         assert trade["equity"] == pytest.approx(100_000 + expected_pnl)
+
+    @pytest.mark.parametrize(
+        ("commission", "expected_fee"),
+        [
+            (Commission(per_contract=0.65, base_fee=9.99), 23.88),
+            (Commission(per_contract=0.10, min_fee=4.95), 9.90),
+        ],
+    )
+    def test_quantity_scales_variable_fees_not_base_or_minimum(
+        self, data, commission, expected_fee
+    ):
+        result = simulate(
+            data,
+            op.long_calls,
+            selector="first",
+            quantity=3,
+            slippage="mid",
+            commission=commission,
+        )
+
+        trade = result.trade_log.iloc[0]
+        gross_pnl = (trade["exit_proceeds"] - trade["entry_cost"]) * 3 * 100
+        assert trade["commission"] == pytest.approx(expected_fee)
+        assert trade["realized_pnl"] == pytest.approx(gross_pnl - expected_fee)
+        assert trade["equity"] == pytest.approx(100_000 + gross_pnl - expected_fee)
+        assert result.summary["total_pnl"] == pytest.approx(gross_pnl - expected_fee)
+
+    def test_missing_or_nan_commission_defaults_to_zero_and_fees_can_flip_win(self):
+        trades = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPX"],
+                "entry_date": [pd.Timestamp("2018-01-01")],
+                "exit_date": [pd.Timestamp("2018-02-01")],
+                "expiration": [pd.Timestamp("2018-02-01")],
+                "entry_cost": [1.0],
+                "exit_proceeds": [1.005],
+                "pct_change": [0.005],
+                "description": ["call"],
+                "exit_type": ["expiration"],
+                "commission": [1.30],
+            }
+        )
+        charged = _build_trade_log(trades, capital=100.0, quantity=1, multiplier=100)
+        summary = _compute_summary(charged, capital=100.0)
+        assert charged["commission"].iloc[0] == pytest.approx(1.30)
+        assert charged["realized_pnl"].iloc[0] == pytest.approx(-0.80)
+        assert charged["cumulative_pnl"].iloc[0] == pytest.approx(-0.80)
+        assert charged["equity"].iloc[0] == pytest.approx(99.20)
+        assert summary["total_pnl"] == pytest.approx(-0.80)
+        assert summary["losing_trades"] == 1
+
+        for commission_values in (None, [float("nan")]):
+            normalized = trades.drop(columns="commission").copy()
+            if commission_values is not None:
+                normalized["commission"] = commission_values
+            free = _build_trade_log(
+                normalized, capital=100.0, quantity=1, multiplier=100
+            )
+            assert free["commission"].iloc[0] == pytest.approx(0.0)
+            assert free["realized_pnl"].iloc[0] == pytest.approx(0.50)
 
     def test_summary_keys(self, data):
         result = simulate(data, op.long_calls)
