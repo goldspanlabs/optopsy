@@ -94,7 +94,9 @@ def macd_cross_below(
 
 def _stoch_k(k_period: int, d_period: int):
     k_period, d_period = int(k_period), int(d_period)
-    min_bars = k_period + d_period - 1
+    # ta.stoch computes raw %K (k_period), smooths %K (smooth_k=d_period),
+    # then smooths %D (d=d_period), requiring k + (d - 1) + (d - 1) = k + 2*d - 2 bars.
+    min_bars = k_period + 2 * d_period - 2
 
     def _indicator(group: pd.DataFrame) -> "pd.Series | None":
         ohlc = _get_ohlc(group)

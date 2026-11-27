@@ -2487,10 +2487,25 @@ class TestSignalsSecondPassRegressions:
             assert not op.macd_cross_below()(df).any()
             assert not op.ppo_cross_above()(df).any()
             assert not op.ppo_cross_below()(df).any()
-        for n in (5, 14, 15):
+
+        # Default stoch(k=14, d=3, smooth_k=3) requires 14 + 2*3 - 2 = 18 bars
+        for n in (5, 14, 15, 16, 17):
             df = self._make_ohlcv(n)
             assert not op.stoch_below()(df).any()
             assert not op.stoch_above()(df).any()
+        # At 18 bars (exact threshold), ta.stoch succeeds without raising
+        df_18 = self._make_ohlcv(18)
+        assert len(op.stoch_below()(df_18)) == 18
+        assert len(op.stoch_above()(df_18)) == 18
+
+        # Non-default stoch(k=14, d=5, smooth_k=5) requires 14 + 2*5 - 2 = 22 bars
+        for n in (18, 20, 21):
+            df = self._make_ohlcv(n)
+            assert not op.stoch_below(k_period=14, d_period=5)(df).any()
+            assert not op.stoch_above(k_period=14, d_period=5)(df).any()
+        df_22 = self._make_ohlcv(22)
+        assert len(op.stoch_below(k_period=14, d_period=5)(df_22)) == 22
+        assert len(op.stoch_above(k_period=14, d_period=5)(df_22)) == 22
 
     def test_custom_signal_accepts_string_and_date_quote_date(self):
         """custom_signal must coerce string and datetime.date quote_date columns."""
