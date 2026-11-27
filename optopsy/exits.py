@@ -366,9 +366,11 @@ def _get_intermediate_snapshots(
         return pd.DataFrame(columns=["_trade_id", "quote_date", "_mid"])
 
     keep_data_cols = list(dict.fromkeys(available_cols + ["quote_date", "bid", "ask"]))
-    merged = data_subset[keep_data_cols].merge(
-        trade_contracts, on=available_cols, how="inner"
+    dedup_keys = list(dict.fromkeys(available_cols + ["quote_date"]))
+    deduped_data = data_subset[keep_data_cols].drop_duplicates(
+        subset=dedup_keys, keep="first"
     )
+    merged = deduped_data.merge(trade_contracts, on=available_cols, how="inner")
 
     if merged.empty:
         return pd.DataFrame(columns=["_trade_id", "quote_date", "_mid"])
