@@ -2220,6 +2220,70 @@ class TestStrategyAndSimulatorSecondPassRegressions:
         assert len(combined) == 1
         assert combined["equity"].iloc[0] == pytest.approx(-2_000.0)
 
+    def test_simulate_portfolio_equity_curve_agrees_with_log_on_ruin(self):
+        """Public simulate_portfolio() equity_curve must stop at ruin and match trade_log/summary,
+        including when multiple trades close on the ruin date."""
+        # Leg A: loses $1,500 on 2024-01-10 (pushes $1,000 portfolio to -$500)
+        leg_a_data = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPY", "call", "2024-01-10", "2024-01-02", 100.0, 20.0, 20.0, 0.30
+                ),
+                _make_option_row(
+                    "SPY", "call", "2024-01-10", "2024-01-10", 100.0, 5.0, 5.0, 0.10
+                ),
+            ]
+        )
+        # Leg B: also closes on 2024-01-10 (loses $200) AND has a later trade on 2024-01-25 (+$300)
+        leg_b_data = pd.DataFrame(
+            [
+                _make_option_row(
+                    "QQQ", "call", "2024-01-10", "2024-01-02", 100.0, 5.0, 5.0, 0.30
+                ),
+                _make_option_row(
+                    "QQQ", "call", "2024-01-10", "2024-01-10", 100.0, 3.0, 3.0, 0.10
+                ),
+                _make_option_row(
+                    "QQQ", "call", "2024-01-25", "2024-01-12", 100.0, 2.0, 2.0, 0.30
+                ),
+                _make_option_row(
+                    "QQQ", "call", "2024-01-25", "2024-01-25", 100.0, 5.0, 5.0, 0.50
+                ),
+            ]
+        )
+        res = op.simulate_portfolio(
+            legs=[
+                {
+                    "name": "leg_a",
+                    "data": leg_a_data,
+                    "strategy": op.long_calls,
+                    "weight": 0.5,
+                    "slippage": "mid",
+                    "max_entry_dte": 30,
+                    "exit_dte": 0,
+                },
+                {
+                    "name": "leg_b",
+                    "data": leg_b_data,
+                    "strategy": op.long_calls,
+                    "weight": 0.5,
+                    "slippage": "mid",
+                    "max_entry_dte": 30,
+                    "exit_dte": 0,
+                },
+            ],
+            capital=1_000.0,
+        )
+        # leg_a closes first on 2024-01-10 (deterministic leg tie-breaker) and ruins portfolio
+        assert len(res.trade_log) == 1
+        assert res.trade_log["equity"].iloc[-1] == pytest.approx(-500.0)
+        assert res.summary["total_pnl"] == pytest.approx(-1_500.0)
+        # Equity curve must end on the ruin date and match trade_log / summary
+        assert res.equity_curve.index.max() == pd.Timestamp("2024-01-10")
+        assert res.equity_curve.iloc[-1] == pytest.approx(
+            res.trade_log["equity"].iloc[-1]
+        )
+
     def test_diagonal_enforces_distinct_strikes_and_uses_distinct_default_deltas(
         self, calendar_data
     ):
@@ -2293,15 +2357,110 @@ class TestSignalsSecondPassRegressions:
         return df
 
     def test_mfi_works_on_realistic_float_ohlcv_under_pandas_3(self):
-        """mfi_above and mfi_below must not raise TypeError on float typical_price * volume."""
+        """mfi_above and mfi_below must compute exact float64 MFI values without pandas 3.0 TypeError."""
+        from optopsy.signals.volume import _compute_mfi
+
+        # 1. Realistic float OHLCV smoke check
         df = self._make_ohlcv(50)
         above = op.mfi_above(period=14, threshold=70)(df)
         below = op.mfi_below(period=14, threshold=30)(df)
         assert above.dtype == bool and len(above) == 50
         assert below.dtype == bool and len(below) == 50
-        # First 14 bars are warmup -> False
         assert not above.iloc[:14].any()
         assert not below.iloc[:14].any()
+
+        def _make_tp_df(tps: list[float], vols: list[float]) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "underlying_symbol": "SPY",
+                    "quote_date": pd.date_range(
+                        "2024-01-01", periods=len(tps), freq="B"
+                    ),
+                    "high": [tp + 0.3 for tp in tps],
+                    "low": [tp - 0.3 for tp in tps],
+                    "close": tps,
+                    "volume": vols,
+                }
+            )
+
+        # 2. Deterministic mixed flow (period=3):
+        #    TP  = [10.0, 11.0 (+), 10.5 (-), 12.0 (+), 9.0 (-)]
+        #    Vol = [100.5, 200.5,   100.5,    300.5,    500.5]
+        #    Bar 3 window (bars 1,2,3):
+        #      pos = 11.0*200.5 + 12.0*300.5 = 2205.5 + 3606.0 = 5811.5
+        #      neg = 10.5*100.5 = 1055.25
+        #      MFI[3] = 100 * 5811.5 / (5811.5 + 1055.25) = 84.632467...
+        #    Bar 4 window (bars 2,3,4):
+        #      pos = 12.0*300.5 = 3606.0
+        #      neg = 10.5*100.5 + 9.0*500.5 = 1055.25 + 4504.5 = 5559.75
+        #      MFI[4] = 100 * 3606.0 / (3606.0 + 5559.75) = 39.342116...
+        mixed_df = _make_tp_df(
+            [10.0, 11.0, 10.5, 12.0, 9.0],
+            [100.5, 200.5, 100.5, 300.5, 500.5],
+        )
+        mfi_vals = _compute_mfi(
+            mixed_df["high"], mixed_df["low"], mixed_df["close"], mixed_df["volume"], 3
+        )
+        assert mfi_vals is not None
+        assert mfi_vals.iloc[:3].isna().all()
+        assert mfi_vals.iloc[3] == pytest.approx(100.0 * 5811.5 / (5811.5 + 1055.25))
+        assert mfi_vals.iloc[4] == pytest.approx(100.0 * 3606.0 / (3606.0 + 5559.75))
+        assert op.mfi_above(period=3, threshold=80)(mixed_df).tolist() == [
+            False,
+            False,
+            False,
+            True,
+            False,
+        ]
+        assert op.mfi_below(period=3, threshold=40)(mixed_df).tolist() == [
+            False,
+            False,
+            False,
+            False,
+            True,
+        ]
+
+        # 3. Positive-only flow -> MFI == 100.0
+        pos_df = _make_tp_df([10.0, 11.0, 12.0, 13.0, 14.0], [100.5] * 5)
+        pos_mfi = _compute_mfi(
+            pos_df["high"], pos_df["low"], pos_df["close"], pos_df["volume"], 3
+        )
+        assert pos_mfi is not None
+        assert pos_mfi.iloc[3:].tolist() == pytest.approx([100.0, 100.0])
+        assert op.mfi_above(period=3, threshold=80)(pos_df).tolist() == [
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]
+        assert not op.mfi_below(period=3, threshold=20)(pos_df).any()
+
+        # 4. Negative-only flow -> MFI == 0.0
+        neg_df = _make_tp_df([14.0, 13.0, 12.0, 11.0, 10.0], [100.5] * 5)
+        neg_mfi = _compute_mfi(
+            neg_df["high"], neg_df["low"], neg_df["close"], neg_df["volume"], 3
+        )
+        assert neg_mfi is not None
+        assert neg_mfi.iloc[3:].tolist() == pytest.approx([0.0, 0.0])
+        assert op.mfi_below(period=3, threshold=20)(neg_df).tolist() == [
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]
+        assert not op.mfi_above(period=3, threshold=80)(neg_df).any()
+
+        # 5. Zero-flow (flat TP) -> MFI is NaN, both signals False
+        flat_df = _make_tp_df([10.0] * 5, [100.5] * 5)
+        flat_mfi = _compute_mfi(
+            flat_df["high"], flat_df["low"], flat_df["close"], flat_df["volume"], 3
+        )
+        assert flat_mfi is not None
+        assert flat_mfi.isna().all()
+        assert not op.mfi_above(period=3, threshold=0)(flat_df).any()
+        assert not op.mfi_below(period=3, threshold=100)(flat_df).any()
 
     def test_macd_cross_matches_on_unsorted_descending_dates(self):
         """Descending quote_date input must match reversed ascending output (no lookahead)."""

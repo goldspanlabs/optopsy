@@ -1012,7 +1012,6 @@ def simulate_portfolio(
 
     # Run each leg
     leg_results: dict[str, SimulationResult] = {}
-    leg_capitals: dict[str, float] = {}
     seen_names: set[str] = set()
 
     for i, leg in enumerate(legs):
@@ -1031,7 +1030,6 @@ def simulate_portfolio(
         seen_names.add(name)
 
         leg_capital = capital * weight
-        leg_capitals[name] = leg_capital
 
         # Build kwargs for simulate(): everything except reserved keys
         sim_kwargs: dict[str, Any] = {
@@ -1041,11 +1039,12 @@ def simulate_portfolio(
 
         leg_results[name] = simulate(data, strategy, **sim_kwargs)
 
-    # Combine trade logs
+    # Combine trade logs (already applies portfolio-level ruin truncation)
     combined_log = _combine_trade_logs(leg_results, capital)
 
-    # Combine equity curves — pass leg_capitals so idle cash is represented
-    combined_curve = _combine_equity_curves(leg_results, leg_capitals)
+    # Build daily portfolio equity curve from the retained combined trade log so
+    # it always agrees with trade_log and summary (including after ruin).
+    combined_curve = _build_portfolio_equity_curve(combined_log)
 
     # Compute portfolio summary from combined trade log
     summary = _compute_summary(combined_log, capital)
@@ -1094,57 +1093,20 @@ def _combine_trade_logs(
     return combined
 
 
-def _combine_equity_curves(
-    leg_results: dict[str, SimulationResult],
-    leg_capitals: dict[str, float],
-) -> pd.Series:
-    """Sum per-leg daily equity curves into a portfolio equity curve.
+def _build_portfolio_equity_curve(combined_log: pd.DataFrame) -> pd.Series:
+    """Build a daily portfolio equity curve from the combined trade log.
 
-    Each leg's curve is seeded with its starting capital so that idle cash
-    (before a leg's first trade closes or for legs that never trade) is
-    correctly represented in the portfolio total.
+    ``combined_log["equity"]`` already incorporates total starting capital
+    across all legs (including idle cash) and reflects portfolio ruin
+    truncation. When multiple trades close on the same exit date, the final
+    retained equity for that date is used, then resampled to daily frequency
+    with forward-fill.
     """
-    # Collect non-empty curves and determine the portfolio date range
-    raw_curves: dict[str, pd.Series] = {}
-    all_dates: list[pd.Timestamp] = []
-    for name, result in leg_results.items():
-        if result.equity_curve.empty:
-            continue
-        curve = result.equity_curve.copy()
-        curve.index = pd.to_datetime(curve.index)
-        raw_curves[name] = curve
-        all_dates.extend([curve.index.min(), curve.index.max()])
-
-    if not all_dates:
+    if combined_log.empty:
         return pd.Series(dtype=float, name="equity")
 
-    portfolio_start = min(all_dates)
-    portfolio_end = max(all_dates)
-    full_index = pd.date_range(portfolio_start, portfolio_end, freq="D")
-
-    # Build a daily curve for each leg, seeded with its starting capital
-    daily_curves: dict[str, pd.Series] = {}
-    for name in leg_results:
-        start_cap = leg_capitals.get(name, 0.0)
-
-        if name in raw_curves:
-            daily = raw_curves[name].resample("D").last().ffill()
-            # Prepend starting capital for days before first trade exit
-            first_date = daily.index.min()
-            if portfolio_start < first_date:
-                pre_index = pd.date_range(
-                    portfolio_start, first_date - pd.Timedelta(days=1), freq="D"
-                )
-                if len(pre_index) > 0:
-                    pre = pd.Series(start_cap, index=pre_index)
-                    daily = pd.concat([pre, daily])
-            daily = daily.reindex(full_index).ffill()
-        else:
-            # Leg never traded — flat line at allocated capital
-            daily = pd.Series(start_cap, index=full_index)
-
-        daily_curves[name] = daily
-
-    combined = pd.DataFrame(daily_curves).sum(axis=1)
-    combined.name = "equity"
-    return combined
+    daily = combined_log.groupby("exit_date")["equity"].last()
+    daily.index = pd.to_datetime(daily.index)
+    daily = daily.sort_index().resample("D").ffill()
+    daily.name = "equity"
+    return daily
