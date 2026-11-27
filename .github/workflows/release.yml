@@ -108,7 +108,10 @@ jobs:
             echo "::error::git ls-remote failed"
             exit 1
           fi
-          if ! releases=$(gh release list --limit 1000 --json tagName --jq '.[].tagName'); then
+          # Drafts are excluded so a draft left over from a failed run is treated
+          # as a missing release (tag without release -> stop for manual resolution)
+          # rather than as a finished one.
+          if ! releases=$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName'); then
             echo "::error::gh release list failed"
             exit 1
           fi
