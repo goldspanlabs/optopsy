@@ -533,6 +533,44 @@ class TestSimulateSmoke:
         assert trade["equity"] == pytest.approx(100_000 + gross_pnl - expected_fee)
         assert result.summary["total_pnl"] == pytest.approx(gross_pnl - expected_fee)
 
+    @pytest.mark.parametrize(("quantity", "multiplier"), [(1, 100), (3, 10)])
+    def test_numeric_string_commission_matches_validated_fees(
+        self, multi_strike_data, stock_data_multi_strike, quantity, multiplier
+    ):
+        commission = {
+            "per_contract": "0.65",
+            "per_share": "0.005",
+            "base_fee": "1.00",
+            "min_fee": "2.00",
+        }
+        original = commission.copy()
+        kwargs = dict(
+            stock_data=stock_data_multi_strike,
+            quantity=quantity,
+            multiplier=multiplier,
+            selector="first",
+            slippage="mid",
+        )
+        actual = simulate(
+            multi_strike_data, op.covered_call, commission=commission, **kwargs
+        )
+        expected = simulate(
+            multi_strike_data,
+            op.covered_call,
+            commission=Commission.model_validate(commission),
+            **kwargs,
+        )
+        pd.testing.assert_frame_equal(actual.trade_log, expected.trade_log)
+        pd.testing.assert_series_equal(actual.equity_curve, expected.equity_curve)
+        fee = 2 * (max(1.0 + 0.65 * quantity, 2.0) + 0.005 * quantity * multiplier)
+        assert actual.trade_log["commission"].iloc[0] == pytest.approx(fee)
+        assert commission == original
+
+    @pytest.mark.parametrize("value", ["invalid", "-0.65"])
+    def test_invalid_string_commission_is_rejected(self, data, value):
+        with pytest.raises(ValueError):
+            simulate(data, op.long_calls, commission={"per_contract": value})
+
     def test_custom_selector_receives_lot_adjusted_candidate_returns(self, data):
         seen = {}
 

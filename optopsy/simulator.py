@@ -136,7 +136,10 @@ def _scale_commission_for_quantity(
     if hasattr(commission, "model_dump"):
         config = commission.model_dump()
     elif isinstance(commission, dict):
-        config = commission.copy()
+        from .types import Commission
+
+        # Coerce accepted fee values (including numeric strings) before scaling.
+        config = Commission.model_validate(commission).model_dump()
     else:
         return commission
 
