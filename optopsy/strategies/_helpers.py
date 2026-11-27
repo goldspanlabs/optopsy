@@ -18,7 +18,11 @@ import numpy as np
 import pandas as pd
 
 from ..checks import _run_checks
-from ..core import _process_calendar_strategy, _process_strategy
+from ..core import (
+    _process_calendar_strategy,
+    _process_strategy,
+    _widen_numeric_columns,
+)
 from ..definitions import (
     calendar_spread_external_cols,
     calendar_spread_internal_cols,
@@ -300,6 +304,10 @@ def _normalize_stock_data(
                 df = df.rename(columns={"level_1": "underlying_symbol"})
         else:
             df.columns = [c[0] for c in df.columns]
+            if len(non_empty_tickers) == 1 and "underlying_symbol" not in [
+                str(c).lower() for c in df.columns
+            ]:
+                df["underlying_symbol"] = non_empty_tickers[0]
 
     # Reset DatetimeIndex to a column (yfinance uses date as index)
     if isinstance(df.index, pd.DatetimeIndex):
@@ -339,8 +347,11 @@ def _normalize_stock_data(
         )
 
     df["quote_date"] = normalize_dates(pd.to_datetime(df["quote_date"]))
-    return df[["underlying_symbol", "quote_date", "close"]].drop_duplicates(
-        subset=["underlying_symbol", "quote_date"], keep="last"
+    df["close"] = pd.to_numeric(df["close"], errors="coerce").astype("float64")
+    return (
+        df[["underlying_symbol", "quote_date", "close"]]
+        .dropna(subset=["close"])
+        .drop_duplicates(subset=["underlying_symbol", "quote_date"], keep="last")
     )
 
 
@@ -482,6 +493,7 @@ def _covered_with_stock(
     data["quote_date"] = normalize_dates(data["quote_date"])
     data["expiration"] = normalize_dates(data["expiration"])
     data["option_type"] = data["option_type"].str.lower()
+    _widen_numeric_columns(data)
 
     delta_target = params["leg1_delta"]
     leg_data = option_filter(data)
@@ -652,6 +664,9 @@ def _collar_with_stock(
     data["quote_date"] = normalize_dates(data["quote_date"])
     data["expiration"] = normalize_dates(data["expiration"])
     data["option_type"] = data["option_type"].str.lower()
+    _widen_numeric_columns(data)
+
+    select_closest_exit = params["exit_dte_tolerance"] == 0
 
     # Evaluate each option leg separately
     leg_results = []
@@ -674,6 +689,7 @@ def _collar_with_stock(
             delta_interval=params["delta_interval"],
             entry_dates=params["entry_dates"],
             exit_dates=params["exit_dates"],
+            select_closest_exit=select_closest_exit,
         )
         leg_results.append((option_leg, evaluated))
 
@@ -719,6 +735,30 @@ def _collar_with_stock(
 
     if result.empty:
         return _empty_result()
+
+    if not select_closest_exit and "quote_date_exit" in result.columns:
+        pos_cols = [
+            "underlying_symbol",
+            "expiration",
+            "quote_date_entry",
+            "dte_entry",
+            "strike_opt1",
+            "strike_opt2",
+        ]
+        actual_exit_dte = (result["expiration"] - result["quote_date_exit"]).dt.days
+        result = (
+            result.assign(
+                _exit_dte_diff=(actual_exit_dte - params["exit_dte"]).abs(),
+                _exit_dte_actual=actual_exit_dte,
+            )
+            .sort_values(
+                ["_exit_dte_diff", "_exit_dte_actual", "quote_date_exit"],
+                kind="mergesort",
+            )
+            .drop_duplicates(subset=pos_cols, keep="first")
+            .drop(columns=["_exit_dte_diff", "_exit_dte_actual"])
+            .reset_index(drop=True)
+        )
 
     # --- apply slippage to option legs ---
     for suffix, opt_leg in [

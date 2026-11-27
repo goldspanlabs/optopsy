@@ -39,6 +39,10 @@ def _groupby_symbol(
         ):
             order = group["quote_date"].to_numpy().argsort(kind="mergesort")
             group = group.iloc[order]
+        if not group.index.is_monotonic_increasing:
+            orig_index = group.index
+            res = compute_group(group.reset_index(drop=True))
+            return pd.Series(res.to_numpy(dtype=bool), index=orig_index, dtype=bool)
         return compute_group(group)
 
     # Single-symbol fast path avoids groupby/concat overhead

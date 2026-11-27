@@ -386,6 +386,18 @@ def _select_by_extremum(
 
 def _select_nearest(candidates: pd.DataFrame) -> pd.Series:
     """Select the trade closest to ATM (delta closest to 0.50)."""
+    # Stock-backed strategies (covered call, protective put, collar with stock_data)
+    # set delta_entry_leg1 = 1.0 for the stock leg; target the option leg instead.
+    if (
+        "option_type_leg1" in candidates.columns
+        and bool((candidates["option_type_leg1"] == "stock").all())
+        and "delta_entry_leg2" in candidates.columns
+        and candidates["delta_entry_leg2"].notna().any()
+    ):
+        return _select_by_extremum(
+            candidates, (candidates["delta_entry_leg2"].abs() - 0.50).abs()
+        )
+
     for delta_col in ("delta_entry", "delta_entry_leg1", "delta_leg1"):
         if delta_col in candidates.columns and candidates[delta_col].notna().any():
             return _select_by_extremum(
@@ -769,6 +781,16 @@ def _unwrap_strategy_name(strategy: Callable[..., Any]) -> str:
     return getattr(fn, "__name__", "")
 
 
+def _extract_partial_kwarg(strategy: Callable[..., Any], key: str) -> tuple[bool, Any]:
+    """Return ``(True, value)`` if *key* is bound in a ``functools.partial`` chain."""
+    fn: Any = strategy
+    while isinstance(fn, partial):
+        if fn.keywords and key in fn.keywords:
+            return True, fn.keywords[key]
+        fn = fn.func
+    return False, None
+
+
 def simulate(
     data: pd.DataFrame,
     strategy: Callable[..., pd.DataFrame],
@@ -833,11 +855,19 @@ def simulate(
 
     # Scale only per-contract and per-share fees for the simulated lot size.
     # Base/minimum fees remain one charge per side of the simulated trade.
+    # Also inspect commissions bound via functools.partial so lot scaling is
+    # not skipped when callers pass partial(op.short_puts, commission=...).
     strategy_kwargs = strategy_kwargs.copy()
     if "commission" in strategy_kwargs:
         strategy_kwargs["commission"] = _scale_commission_for_quantity(
             strategy_kwargs["commission"], quantity, multiplier
         )
+    else:
+        has_bound_comm, bound_comm = _extract_partial_kwarg(strategy, "commission")
+        if has_bound_comm and bound_comm is not None:
+            strategy_kwargs["commission"] = _scale_commission_for_quantity(
+                bound_comm, quantity, multiplier
+            )
 
     # Generate raw trades — return empty result for empty input
     if data.empty:
@@ -883,7 +913,10 @@ def simulate(
     trades = _normalise_trades(
         selected_raw, is_short_single=is_short_single, exit_dte=exit_dte
     )
-    trades = trades.sort_values("entry_date").reset_index(drop=True)
+    sort_cols = ["entry_date"] + (
+        ["underlying_symbol"] if "underlying_symbol" in trades.columns else []
+    )
+    trades = trades.sort_values(sort_cols, kind="mergesort").reset_index(drop=True)
 
     # Filter trades by position limits and overlap rules
     filtered = _filter_trades(trades, max_positions)
@@ -947,6 +980,16 @@ def simulate_portfolio(
     """
     if not legs:
         raise ValueError("legs must be a non-empty list")
+
+    if (
+        isinstance(capital, bool)
+        or not isinstance(capital, (int, float))
+        or not np.isfinite(capital)
+        or capital <= 0
+    ):
+        raise ValueError(
+            "Invalid setting for capital, must be a positive finite int or float"
+        )
 
     # Validate each leg has required keys
     for i, leg in enumerate(legs):
@@ -1034,12 +1077,20 @@ def _combine_trade_logs(
     combined = pd.concat(all_logs, ignore_index=True)
     # Sort by exit_date (when P&L is realized) for correct cumulative equity,
     # with entry_date and leg as deterministic tie-breakers.
-    combined = combined.sort_values(["exit_date", "entry_date", "leg"]).reset_index(
-        drop=True
-    )
+    combined = combined.sort_values(
+        ["exit_date", "entry_date", "leg"], kind="mergesort"
+    ).reset_index(drop=True)
     combined["trade_id"] = np.arange(1, len(combined) + 1)
     combined["cumulative_pnl"] = combined["realized_pnl"].cumsum()
     combined["equity"] = capital + combined["cumulative_pnl"]
+
+    # Ruin check: truncate at first trade where portfolio equity <= 0
+    # (prevents sign-inverted pct_change() returns on negative equity).
+    ruin_mask = combined["equity"] <= 0
+    if ruin_mask.any():
+        ruin_idx = ruin_mask.idxmax()
+        combined = combined.loc[:ruin_idx]
+
     return combined
 
 

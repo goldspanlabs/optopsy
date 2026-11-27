@@ -54,8 +54,11 @@ def _macd_lines(
     fast: int, slow: int, signal_period: int
 ) -> Callable[[pd.Series], tuple[pd.Series | None, pd.Series | None]]:
     """Return a function that computes (macd_line, signal_line) from prices."""
+    min_bars = max(fast, slow) + signal_period - 1
 
     def _compute(prices: pd.Series) -> tuple[pd.Series | None, pd.Series | None]:
+        if len(prices) < min_bars:
+            return None, None
         macd_df = ta.macd(prices, fast=fast, slow=slow, signal=signal_period)
         if macd_df is None:
             return None, None
@@ -90,11 +93,16 @@ def macd_cross_below(
 
 
 def _stoch_k(k_period: int, d_period: int):
+    k_period, d_period = int(k_period), int(d_period)
+    min_bars = k_period + d_period - 1
+
     def _indicator(group: pd.DataFrame) -> "pd.Series | None":
         ohlc = _get_ohlc(group)
         if ohlc is None:
             return None
         high, low, close = ohlc
+        if len(close) < min_bars:
+            return None
         result = ta.stoch(high, low, close, k=k_period, d=d_period, smooth_k=d_period)
         if result is None:
             return None
@@ -133,7 +141,12 @@ def stochrsi_below(
     threshold: float = 20,
 ) -> SignalFunc:
     """True when StochRSI %K is below threshold (oversold)."""
-    col = f"STOCHRSIk_{period}_{rsi_period}_{k_smooth}_{d_smooth}"
+    period, rsi_period, k_smooth, d_smooth = (
+        int(period),
+        int(rsi_period),
+        int(k_smooth),
+        int(d_smooth),
+    )
 
     def _indicator(group: pd.DataFrame) -> "pd.Series | None":
         close = _get_close(group)
@@ -142,9 +155,12 @@ def stochrsi_below(
         result = ta.stochrsi(
             close, length=period, rsi_length=rsi_period, k=k_smooth, d=d_smooth
         )
-        if result is None or col not in result.columns:
+        if result is None:
             return None
-        return result[col]
+        k_cols = [c for c in result.columns if c.startswith("STOCHRSIk_")]
+        if not k_cols:
+            return None
+        return result[k_cols[0]]
 
     return _ohlcv_signal(_indicator, lambda ind: ind < threshold)
 
@@ -157,7 +173,12 @@ def stochrsi_above(
     threshold: float = 80,
 ) -> SignalFunc:
     """True when StochRSI %K is above threshold (overbought)."""
-    col = f"STOCHRSIk_{period}_{rsi_period}_{k_smooth}_{d_smooth}"
+    period, rsi_period, k_smooth, d_smooth = (
+        int(period),
+        int(rsi_period),
+        int(k_smooth),
+        int(d_smooth),
+    )
 
     def _indicator(group: pd.DataFrame) -> "pd.Series | None":
         close = _get_close(group)
@@ -166,9 +187,12 @@ def stochrsi_above(
         result = ta.stochrsi(
             close, length=period, rsi_length=rsi_period, k=k_smooth, d=d_smooth
         )
-        if result is None or col not in result.columns:
+        if result is None:
             return None
-        return result[col]
+        k_cols = [c for c in result.columns if c.startswith("STOCHRSIk_")]
+        if not k_cols:
+            return None
+        return result[k_cols[0]]
 
     return _ohlcv_signal(_indicator, lambda ind: ind > threshold)
 
@@ -267,16 +291,20 @@ def _ppo_lines(
     fast: int, slow: int, signal_period: int
 ) -> Callable[[pd.Series], tuple[pd.Series | None, pd.Series | None]]:
     """Return (PPO_line, PPO_signal_line) from prices."""
-    ppo_col = f"PPO_{fast}_{slow}_{signal_period}"
-    sig_col = f"PPOs_{fast}_{slow}_{signal_period}"
+    fast, slow, signal_period = int(fast), int(slow), int(signal_period)
+    min_bars = max(fast, slow) + signal_period - 1
 
     def _compute(prices: pd.Series) -> tuple[pd.Series | None, pd.Series | None]:
+        if len(prices) < min_bars:
+            return None, None
         result = ta.ppo(prices, fast=fast, slow=slow, signal=signal_period)
         if result is None:
             return None, None
-        if ppo_col not in result.columns or sig_col not in result.columns:
+        ppo_cols = [c for c in result.columns if c.startswith("PPO_")]
+        sig_cols = [c for c in result.columns if c.startswith("PPOs_")]
+        if not ppo_cols or not sig_cols:
             return None, None
-        return result[ppo_col], result[sig_col]
+        return result[ppo_cols[0]], result[sig_cols[0]]
 
     return _compute
 
