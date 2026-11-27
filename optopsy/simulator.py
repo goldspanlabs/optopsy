@@ -81,6 +81,7 @@ _TRADE_LOG_COLUMNS = [
     "multiplier",
     "dollar_cost",
     "dollar_proceeds",
+    "commission",
     "realized_pnl",
     "pct_change",
     "cumulative_pnl",
@@ -115,6 +116,66 @@ def _is_single_leg(columns: pd.Index) -> bool:
 
 def _is_calendar(columns: pd.Index) -> bool:
     return _CALENDAR_MARKER in columns
+
+
+def _scale_commission_for_quantity(
+    commission: Any, quantity: int, multiplier: int
+) -> Any:
+    """Scale variable fees to the simulated lot size.
+
+    Base and minimum fees apply once per side of the simulated trade, so they
+    must not be multiplied by the number of contracts. Per-share fees scale
+    with the simulated share count (quantity * multiplier).
+    """
+    if commission is None:
+        return commission
+
+    if isinstance(commission, (int, float)) and not isinstance(commission, bool):
+        return commission * quantity
+
+    if hasattr(commission, "model_dump"):
+        config = commission.model_dump()
+    elif isinstance(commission, dict):
+        from .types import Commission
+
+        # Coerce accepted fee values (including numeric strings) before scaling.
+        config = Commission.model_validate(commission).model_dump()
+    else:
+        return commission
+
+    if "per_contract" in config:
+        config["per_contract"] *= quantity
+    if "per_share" in config:
+        config["per_share"] *= quantity * multiplier / 100
+    return config
+
+
+def _adjust_candidate_returns(raw: pd.DataFrame, lot_size: int) -> pd.DataFrame:
+    """Recompute candidate returns after applying lot-sized commission.
+
+    Strategy functions express prices per standard 100-share contract and
+    deduct commission in those same units. Recover gross per-contract P&L,
+    then apply the simulated lot size and dollar commission before selectors
+    inspect ``pct_change``.
+    """
+    if "total_commission" not in raw.columns or "pct_change" not in raw.columns:
+        return raw
+
+    entry_col = "total_entry_cost" if "total_entry_cost" in raw.columns else "entry"
+    if entry_col not in raw.columns:
+        return raw
+
+    basis = pd.to_numeric(raw[entry_col], errors="coerce").abs()
+    fee = pd.to_numeric(raw["total_commission"], errors="coerce").fillna(0.0)
+    pct_change = pd.to_numeric(raw["pct_change"], errors="coerce")
+    gross_pnl_per_contract = pct_change * basis + fee / 100
+    denominator = basis * lot_size
+    raw["pct_change"] = np.where(
+        denominator > 0,
+        (gross_pnl_per_contract * lot_size - fee) / denominator,
+        np.nan,
+    )
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +231,11 @@ def _normalise_trades(
         has_early = pd.notna(early)
         df["exit_date"] = np.where(has_early, early, np.asarray(df["exit_date"]))
 
+    df["commission"] = (
+        raw["total_commission"].fillna(0.0).values
+        if "total_commission" in raw.columns
+        else 0.0
+    )
     return df
 
 
@@ -585,6 +651,12 @@ def _build_trade_log(
     if trades.empty:
         return pd.DataFrame(columns=_TRADE_LOG_COLUMNS)
 
+    commission = (
+        trades["commission"].fillna(0.0).to_numpy(dtype=float)
+        if "commission" in trades.columns
+        else np.zeros(len(trades), dtype=float)
+    )
+
     trade_log = pd.DataFrame(
         {
             "trade_id": np.arange(1, len(trades) + 1),
@@ -594,6 +666,7 @@ def _build_trade_log(
             "expiration": trades["expiration"].values,
             "entry_cost": trades["entry_cost"].values,
             "exit_proceeds": trades["exit_proceeds"].values,
+            "commission": commission,
             "quantity": quantity,
             "multiplier": multiplier,
             "pct_change": trades["pct_change"].values,
@@ -609,7 +682,13 @@ def _build_trade_log(
     trade_log["dollar_proceeds"] = trade_log["exit_proceeds"] * lot_size
     trade_log["realized_pnl"] = (
         trade_log["exit_proceeds"] - trade_log["entry_cost"]
-    ) * lot_size
+    ) * lot_size - trade_log["commission"]
+    trade_log["pct_change"] = np.where(
+        # Keep strategy-specific return guards (e.g. near-zero calendar entries).
+        trade_log["pct_change"].notna() & (trade_log["dollar_cost"] > 0),
+        trade_log["realized_pnl"] / trade_log["dollar_cost"],
+        np.nan,
+    )
     trade_log["days_held"] = (
         pd.to_datetime(trade_log["exit_date"]) - pd.to_datetime(trade_log["entry_date"])
     ).dt.days
@@ -687,6 +766,14 @@ def simulate(
     else:
         select_fn = selector
 
+    # Scale only per-contract and per-share fees for the simulated lot size.
+    # Base/minimum fees remain one charge per side of the simulated trade.
+    strategy_kwargs = strategy_kwargs.copy()
+    if "commission" in strategy_kwargs:
+        strategy_kwargs["commission"] = _scale_commission_for_quantity(
+            strategy_kwargs["commission"], quantity, multiplier
+        )
+
     # Generate raw trades — return empty result for empty input
     if data.empty:
         raw = pd.DataFrame()
@@ -701,6 +788,8 @@ def simulate(
             equity_curve=empty_curve,
             summary=_compute_summary(empty_log, capital),
         )
+
+    raw = _adjust_candidate_returns(raw, quantity * multiplier)
 
     # Select one trade per entry date (on raw data so OTM% columns are
     # available to selectors)

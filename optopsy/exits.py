@@ -15,6 +15,8 @@ from typing import Any, Dict, List, Optional, Tuple, cast
 import numpy as np
 import pandas as pd
 
+from .pricing import _SHARES_PER_CONTRACT, _calculate_fill_price
+
 
 def _scalar_float(val: Any) -> float:
     """Extract a scalar float from a DataFrame.at[] value."""
@@ -56,11 +58,11 @@ def _apply_early_exits(
 
     if len(leg_def) == 1:
         return _apply_single_leg_exits(
-            result, data, leg_def, stop_loss, take_profit, max_hold_days
+            result, data, leg_def, stop_loss, take_profit, max_hold_days, params
         )
     else:
         return _apply_multi_leg_exits(
-            result, data, leg_def, stop_loss, take_profit, max_hold_days
+            result, data, leg_def, stop_loss, take_profit, max_hold_days, params
         )
 
 
@@ -71,6 +73,7 @@ def _apply_single_leg_exits(
     stop_loss: Optional[float],
     take_profit: Optional[float],
     max_hold_days: Optional[int] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """Apply early exits for single-leg strategies.
 
@@ -116,7 +119,9 @@ def _apply_single_leg_exits(
     )
 
     if not triggered.empty:
-        result = _replace_exits_single_leg(result, triggered, data, side_value)
+        result = _replace_exits_single_leg(
+            result, triggered, data, side_value, params or {}
+        )
 
     result.drop(columns=["_trade_id"], inplace=True)
     return result
@@ -129,6 +134,7 @@ def _apply_multi_leg_exits(
     stop_loss: Optional[float],
     take_profit: Optional[float],
     max_hold_days: Optional[int] = None,
+    params: Optional[Dict[str, Any]] = None,
 ) -> pd.DataFrame:
     """Apply early exits for multi-leg strategies.
 
@@ -267,7 +273,9 @@ def _apply_multi_leg_exits(
     )
 
     if not triggered.empty:
-        result = _replace_exits_multi_leg(result, triggered, data, leg_def)
+        result = _replace_exits_multi_leg(
+            result, triggered, data, leg_def, params or {}
+        )
 
     result.drop(columns=["_trade_id"], inplace=True)
     return result
@@ -417,6 +425,7 @@ def _replace_exits_single_leg(
     triggered: pd.DataFrame,
     data: pd.DataFrame,
     side_value: int,
+    params: Dict[str, Any],
 ) -> pd.DataFrame:
     """Replace exit data for triggered single-leg trades.
 
@@ -433,6 +442,8 @@ def _replace_exits_single_leg(
 
     # Get contract details from result for triggered trades
     result_cols = ["_trade_id", "underlying_symbol", "expiration", "strike", "entry"]
+    if "total_commission" in result.columns:
+        result_cols.append("total_commission")
     if "option_type" in result.columns:
         result_cols.append("option_type")
 
@@ -446,7 +457,8 @@ def _replace_exits_single_leg(
     lookup = lookup.rename(columns={"_exit_quote_date": "quote_date"})
     # Deduplicate data on merge keys to avoid expanding trades
     data_exit_keys = ["quote_date"] + data_merge_cols
-    data_exit = data[data_exit_keys + ["bid", "ask"]].drop_duplicates(
+    exit_price_cols = ["bid", "ask"] + (["volume"] if "volume" in data.columns else [])
+    data_exit = data[data_exit_keys + exit_price_cols].drop_duplicates(
         subset=data_exit_keys, keep="first"
     )
     lookup = lookup.merge(
@@ -459,11 +471,28 @@ def _replace_exits_single_leg(
         return result
 
     # Compute new exit prices and pct_change using known side_value
-    lookup["_new_exit"] = (lookup["bid"] + lookup["ask"]) / 2
+    volume = lookup["volume"] if "volume" in lookup.columns else None
+    lookup["_new_exit"] = _calculate_fill_price(
+        lookup["bid"],
+        lookup["ask"],
+        -side_value,
+        params.get("slippage", "mid"),
+        params.get("fill_ratio", 0.5),
+        volume,
+        params.get("reference_volume", 1000),
+        params.get("per_leg_slippage", 0.0),
+        num_legs=1,
+    )
     entry_price = lookup["entry"]
+    commission = (
+        lookup["total_commission"] / _SHARES_PER_CONTRACT
+        if "total_commission" in lookup.columns
+        else 0.0
+    )
     lookup["_new_pct"] = np.where(
         entry_price.abs() > 0,
-        side_value * (lookup["_new_exit"] - entry_price) / entry_price.abs(),
+        (side_value * (lookup["_new_exit"] - entry_price) - commission)
+        / entry_price.abs(),
         np.nan,
     )
 
@@ -500,6 +529,7 @@ def _replace_exits_multi_leg(
     triggered: pd.DataFrame,
     data: pd.DataFrame,
     leg_def: List[Tuple],
+    params: Dict[str, Any],
 ) -> pd.DataFrame:
     """Replace exit data for triggered multi-leg trades."""
     n_legs = len(leg_def)
@@ -558,9 +588,17 @@ def _replace_exits_multi_leg(
         # Merge with data at exit date
         leg_lookup = leg_lookup.rename(columns={"_exit_quote_date": "quote_date"})
 
-        data_merge = data[
-            ["quote_date", "underlying_symbol", "expiration", "strike", "bid", "ask"]
-        ].copy()
+        data_cols = [
+            "quote_date",
+            "underlying_symbol",
+            "expiration",
+            "strike",
+            "bid",
+            "ask",
+        ]
+        if "volume" in data.columns:
+            data_cols.append("volume")
+        data_merge = data[data_cols].copy()
         if "option_type" in data.columns:
             data_merge["option_type"] = data["option_type"]
             leg_lookup_merge = leg_lookup.rename(
@@ -590,10 +628,21 @@ def _replace_exits_multi_leg(
         found_ids = set(merged["_trade_id"].values)
         valid_ids &= found_ids
 
-        merged["_new_mid"] = (merged[bid_col_data] + merged[ask_col_data]) / 2
+        volume = merged["volume"] if "volume" in merged.columns else None
+        merged["_new_exit"] = _calculate_fill_price(
+            merged[bid_col_data],
+            merged[ask_col_data],
+            -side_value,
+            params.get("slippage", "mid"),
+            params.get("fill_ratio", 0.5),
+            volume,
+            params.get("reference_volume", 1000),
+            params.get("per_leg_slippage", 0.0),
+            num_legs=n_legs,
+        )
 
         leg_updates[leg_idx] = (
-            merged[["_trade_id", bid_col_data, ask_col_data, "_new_mid"]]
+            merged[["_trade_id", bid_col_data, ask_col_data, "_new_exit"]]
             .rename(columns={bid_col_data: "_bid", ask_col_data: "_ask"})
             .copy()
         )
@@ -626,11 +675,11 @@ def _replace_exits_multi_leg(
             result_indexed.loc[updates.index, ask_col] = updates["_ask"].values
         if exit_col in result_indexed.columns:
             result_indexed.loc[updates.index, exit_col] = (
-                updates["_new_mid"] * updates["_multiplier"]
+                updates["_new_exit"] * updates["_multiplier"]
             ).values
 
         leg_exit_values = np.asarray(
-            (updates["_new_mid"] * updates["_multiplier"]).values
+            (updates["_new_exit"] * updates["_multiplier"]).values
         )
         new_exit_totals.loc[updates.index] = (
             new_exit_totals.loc[updates.index].values + leg_exit_values
@@ -651,9 +700,18 @@ def _replace_exits_multi_leg(
             new_exit_totals.values
         )
 
+    commission = (
+        result_indexed.loc[valid_trig.index, "total_commission"] / _SHARES_PER_CONTRACT
+        if "total_commission" in result_indexed.columns
+        else 0.0
+    )
     result_indexed.loc[valid_trig.index, "pct_change"] = np.where(
         entry_totals.abs() > 0,
-        (np.asarray(new_exit_totals.values) - np.asarray(entry_totals.values))
+        (
+            np.asarray(new_exit_totals.values)
+            - np.asarray(entry_totals.values)
+            - np.asarray(commission)
+        )
         / np.asarray(entry_totals.abs().values),
         np.nan,
     )
