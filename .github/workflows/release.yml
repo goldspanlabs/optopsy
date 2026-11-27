@@ -1,0 +1,145 @@
+# One-click release: bumps the version, commits it, tags it, creates the
+# GitHub release, and then runs python-publish.yml against the new tag to
+# upload to PyPI.
+#
+# Why python-publish is dispatched explicitly: events created with the default
+# GITHUB_TOKEN do not trigger other workflows, so the `release: published`
+# trigger in python-publish.yml would not fire from here. workflow_dispatch is
+# the one event GITHUB_TOKEN may trigger, and it keeps python-publish's
+# trusted-publishing identity unchanged.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact version to release (e.g. 2.3.1, 2.4.0b1). Leave empty to bump from the current version."
+        required: false
+        type: string
+      bump:
+        description: "Bump type used when version is empty"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      prerelease:
+        description: "Mark the GitHub release as a pre-release"
+        required: true
+        type: boolean
+        default: false
+      notes:
+        description: "Release notes (leave empty to auto-generate from merged PRs)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute and apply version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, tomllib, pathlib
+
+          pyproject = pathlib.Path("pyproject.toml")
+          text = pyproject.read_text()
+          current = tomllib.loads(text)["project"]["version"]
+
+          requested = os.environ["INPUT_VERSION"].strip().lstrip("v")
+          if requested:
+              new = requested
+          else:
+              m = re.match(r"^(\d+)\.(\d+)\.(\d+)", current)
+              if not m:
+                  raise SystemExit(f"Cannot parse current version {current!r}")
+              major, minor, patch = map(int, m.groups())
+              bump = os.environ["BUMP"]
+              if bump == "major":
+                  major, minor, patch = major + 1, 0, 0
+              elif bump == "minor":
+                  major, minor, patch = major, minor + 1, 0
+              else:
+                  patch += 1
+              new = f"{major}.{minor}.{patch}"
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+((a|b|rc)\d+)?", new):
+              raise SystemExit(f"Invalid version {new!r}")
+          if new == current:
+              raise SystemExit(f"Version {new} is already the current version")
+
+          updated, n = re.subn(
+              r'^version = "[^"]+"',
+              f'version = "{new}"',
+              text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          if n != 1:
+              raise SystemExit("Could not find version line in pyproject.toml")
+          pyproject.write_text(updated)
+
+          print(f"{current} -> {new}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={new}\n")
+              out.write(f"tag=v{new}\n")
+          EOF
+
+      - name: Fail if tag already exists
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+
+      - name: Commit and push version bump
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "Release v$VERSION"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(--target "$(git rev-parse HEAD)" --title "$TAG")
+          if [ -n "$NOTES" ]; then
+            args+=(--notes "$NOTES")
+          else
+            args+=(--generate-notes)
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"
+
+      - name: Dispatch PyPI publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run python-publish.yml --ref "$TAG"
