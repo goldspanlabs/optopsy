@@ -185,13 +185,28 @@ jobs:
             exit 1
           fi
 
-      - name: Apply version to pyproject.toml
+      - name: Apply version to pyproject.toml and uv.lock
         if: ${{ (steps.state.outputs.release_exists == 'false' || inputs.dry_run) && steps.version.outputs.needs_bump == 'true' }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$VERSION\"/" pyproject.toml
           grep -q "^version = \"$VERSION\"" pyproject.toml
+          # uv.lock records the project's own version, so keep it in step with the bump.
+          python3 - <<'EOF'
+          import os, pathlib, re
+          version = os.environ["VERSION"]
+          lock = pathlib.Path("uv.lock")
+          new, n = re.subn(
+              r'(\[\[package\]\]\nname = "optopsy"\nversion = ")[^"]+(")',
+              rf"\g<1>{version}\g<2>",
+              lock.read_text(),
+              count=1,
+          )
+          if n != 1:
+              raise SystemExit("Could not find the optopsy entry in uv.lock")
+          lock.write_text(new)
+          EOF
 
       - name: Set up uv
         if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
@@ -200,6 +215,10 @@ jobs:
       - name: Set up Python
         if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         run: uv python install 3.13
+
+      - name: Check uv.lock is up to date
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        run: uv lock --check
 
       - name: Install dependencies
         if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
@@ -277,7 +296,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add pyproject.toml
+          git add pyproject.toml uv.lock
           git commit -m "Release v$VERSION"
           git push origin "HEAD:${GITHUB_REF_NAME}"
 

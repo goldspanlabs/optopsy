@@ -207,7 +207,7 @@ Publishing to PyPI is automated via GitHub Actions (`.github/workflows/python-pu
    - `publish` — upload to PyPI; off by default, so tick it only for a real release
    - `notes` — optional; auto-generated from merged PRs if empty
    - `dry_run` — run every check and build the wheel, without committing, tagging, releasing, or publishing
-2. Before anything is pushed, the workflow bumps `pyproject.toml` and checks the bumped tree: CI must be green on the source commit, then lint, type check, the full test suite, and the wheel build run. The full test suite is then run against the wheel installed into a clean venv.
+2. Before anything is pushed, the workflow bumps the version in `pyproject.toml` and `uv.lock` (the lockfile records the project's own version) and checks the bumped tree: CI must be green on the source commit, then lint, type check, the full test suite, and the wheel build run. The full test suite is then run against the wheel installed into a clean venv.
 3. If checks pass, it commits and pushes the bump to the branch you ran it on, creates the `v<version>` tag and GitHub release, and, if `publish` is ticked, dispatches `python-publish.yml` on that tag.
 
 Notes:
