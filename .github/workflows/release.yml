@@ -1,0 +1,308 @@
+# One-click release: bumps the version, verifies the bumped tree (CI state,
+# lint, full test suite, and the built wheel installed into a clean venv),
+# then commits, tags, creates the GitHub release, and optionally runs
+# python-publish.yml against the new tag to upload to PyPI.
+#
+# Verification runs before anything is pushed or tagged. The working tree that
+# is verified is the same tree that gets committed.
+#
+# Publishing is opt-in: the `publish` input must be ticked. A pre-release flag
+# only marks the GitHub release. It does not stop the PyPI upload, so betas
+# are only published when `publish` is set.
+#
+# Why python-publish is dispatched explicitly: events created with the default
+# GITHUB_TOKEN do not trigger other workflows, so the `release: published`
+# trigger in python-publish.yml would not fire from here. workflow_dispatch is
+# the one event GITHUB_TOKEN may trigger, and it keeps python-publish's
+# trusted-publishing identity unchanged.
+#
+# Retrying a failed run: re-run it with the same exact `version` input. Each
+# stage is skipped when its work already exists (bump commit on the branch,
+# tag/release on GitHub), so a retry picks up where the failure happened.
+# Do not retry with `bump` on a run that already pushed the bump commit: the
+# bump would be applied a second time.
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Exact version to release (e.g. 2.3.1, 2.4.0b1). Leave empty to bump from the current version. Pass this explicitly when retrying a failed run."
+        required: false
+        type: string
+      bump:
+        description: "Bump type used when version is empty"
+        required: true
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+        default: patch
+      prerelease:
+        description: "Mark the GitHub release as a pre-release (does not affect PyPI)"
+        required: true
+        type: boolean
+        default: false
+      publish:
+        description: "Upload to PyPI. Off by default: leave unticked for a dry check or a GitHub-only release."
+        required: true
+        type: boolean
+        default: false
+      notes:
+        description: "Release notes (leave empty to auto-generate from merged PRs)"
+        required: false
+        type: string
+      dry_run:
+        description: "Run every check and the wheel build, but make no commit, tag, release, or PyPI publish"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Compute version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          BUMP: ${{ inputs.bump }}
+        run: |
+          python3 - <<'EOF'
+          import os, re, tomllib, pathlib
+
+          text = pathlib.Path("pyproject.toml").read_text()
+          current = tomllib.loads(text)["project"]["version"]
+
+          requested = os.environ["INPUT_VERSION"].strip().lstrip("v")
+          if requested:
+              new = requested
+          else:
+              m = re.match(r"^(\d+)\.(\d+)\.(\d+)", current)
+              if not m:
+                  raise SystemExit(f"Cannot parse current version {current!r}")
+              major, minor, patch = map(int, m.groups())
+              bump = os.environ["BUMP"]
+              if bump == "major":
+                  major, minor, patch = major + 1, 0, 0
+              elif bump == "minor":
+                  major, minor, patch = major, minor + 1, 0
+              else:
+                  patch += 1
+              new = f"{major}.{minor}.{patch}"
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+((a|b|rc)\d+)?", new):
+              raise SystemExit(f"Invalid version {new!r}")
+
+          needs_bump = new != current
+          print(f"{current} -> {new} (bump needed: {needs_bump})")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"version={new}\n")
+              out.write(f"tag=v{new}\n")
+              out.write(f"current={current}\n")
+              out.write(f"needs_bump={str(needs_bump).lower()}\n")
+          EOF
+
+      - name: Check for existing tag and release
+        id: state
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          # Check each lookup's exit status: a network or auth failure must
+          # stop the run, not look like "not found".
+          if ! remote_tags=$(git ls-remote --tags origin); then
+            echo "::error::git ls-remote failed"
+            exit 1
+          fi
+          # Drafts are excluded so a draft left over from a failed run is treated
+          # as a missing release (tag without release -> stop for manual resolution)
+          # rather than as a finished one.
+          if ! releases=$(gh release list --exclude-drafts --limit 1000 --json tagName --jq '.[].tagName'); then
+            echo "::error::gh release list failed"
+            exit 1
+          fi
+
+          tag_exists=false
+          release_exists=false
+          # Match the exact ref name (not a prefix such as v2.3.1 vs v2.3.10).
+          if awk -v t="refs/tags/$TAG" '$2 == t || $2 == t "^{}" { found = 1 } END { exit !found }' <<< "$remote_tags"; then
+            tag_exists=true
+          fi
+          if grep -Fxq "$TAG" <<< "$releases"; then release_exists=true; fi
+
+          if [ "$tag_exists" = "true" ] && [ "$release_exists" = "false" ]; then
+            echo "::error::Tag $TAG exists without a GitHub release. Resolve manually before retrying."
+            exit 1
+          fi
+
+          echo "tag_exists=$tag_exists" >> "$GITHUB_OUTPUT"
+          echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
+
+      - name: Require green CI on the source commit
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # The release commit is pushed with GITHUB_TOKEN, which does not trigger
+          # CI. On a retry after the bump was already pushed, HEAD is that bump
+          # commit, so CI is checked on the commit it was built from (its parent).
+          source_sha="$GITHUB_SHA"
+          subject=$(git log -1 --format=%s "$GITHUB_SHA")
+          author=$(git log -1 --format=%an "$GITHUB_SHA")
+          if [ "$subject" = "Release v$VERSION" ] && [ "$author" = "github-actions[bot]" ]; then
+            source_sha=$(git rev-parse "$GITHUB_SHA^")
+            echo "Bump commit detected; checking CI on its parent $source_sha"
+          fi
+
+          # Only the ci.yml workflow is checked, so this job's own in-progress
+          # check run does not block itself.
+          if ! latest=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$source_sha&per_page=20" \
+              --jq '[.workflow_runs[] | {status, conclusion, created_at}] | sort_by(.created_at) | last // empty'); then
+            echo "::error::Could not read CI runs for $source_sha"
+            exit 1
+          fi
+          if [ -z "$latest" ]; then
+            echo "::error::No CI run found for $source_sha"
+            exit 1
+          fi
+          status=$(jq -r '.status' <<< "$latest")
+          conclusion=$(jq -r '.conclusion' <<< "$latest")
+          if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+            echo "::error::Latest CI run for $source_sha is $status/$conclusion"
+            exit 1
+          fi
+
+      - name: Apply version to pyproject.toml
+        if: ${{ (steps.state.outputs.release_exists == 'false' || inputs.dry_run) && steps.version.outputs.needs_bump == 'true' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$VERSION\"/" pyproject.toml
+          grep -q "^version = \"$VERSION\"" pyproject.toml
+
+      - name: Set up uv
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        uses: astral-sh/setup-uv@v7
+
+      - name: Set up Python
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        run: uv python install 3.13
+
+      - name: Install dependencies
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        run: uv sync --extra data --extra ui
+
+      - name: Lint and type check
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        run: |
+          uv run ruff format --check optopsy/ tests/
+          uv run ruff check optopsy/ tests/
+          uv run ty check optopsy/
+
+      - name: Run test suite
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        run: uv run pytest tests/ -v
+
+      - name: Build wheel and sdist
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        run: uv build
+
+      - name: Test the built wheel in a clean environment
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # A fresh venv outside the repo, so optopsy can only come from the wheel.
+          wheel=$(ls dist/optopsy-*.whl)
+          py=$(uv python find 3.13)
+          "$py" -m venv "$RUNNER_TEMP/wheel-venv"
+          "$RUNNER_TEMP/wheel-venv/bin/pip" install -q "${wheel}[data,ui]" pytest
+
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/wheel-venv/bin/python" - <<'PY'
+          import importlib.metadata as md, os, optopsy
+          version = os.environ["VERSION"]
+          assert md.version("optopsy") == version, (md.version("optopsy"), version)
+          assert "wheel-venv" in optopsy.__file__, optopsy.__file__
+          print("installed", optopsy.__file__, md.version("optopsy"))
+          PY
+
+          # Run the full suite against the installed package, not the source tree.
+          # Copy the test-only support files too: tests load ../samples and the root conftest.
+          mkdir -p "$RUNNER_TEMP/wheel-check"
+          cp -r "$GITHUB_WORKSPACE/tests" "$RUNNER_TEMP/wheel-check/tests"
+          cp -r "$GITHUB_WORKSPACE/samples" "$RUNNER_TEMP/wheel-check/samples"
+          cp "$GITHUB_WORKSPACE/conftest.py" "$RUNNER_TEMP/wheel-check/conftest.py"
+          cd "$RUNNER_TEMP/wheel-check"
+          "$RUNNER_TEMP/wheel-venv/bin/python" -m pytest tests -q -p no:cacheprovider
+
+      - name: Dry run summary
+        if: inputs.dry_run
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION_OUT: ${{ steps.version.outputs.version }}
+          CURRENT: ${{ steps.version.outputs.current }}
+          NEEDS_BUMP: ${{ steps.version.outputs.needs_bump }}
+          TAG_EXISTS: ${{ steps.state.outputs.tag_exists }}
+          RELEASE_EXISTS: ${{ steps.state.outputs.release_exists }}
+        run: |
+          {
+            echo "### Release dry run"
+            echo "- Current version: \`$CURRENT\`"
+            echo "- Target version: \`$VERSION_OUT\` (tag \`$TAG\`)"
+            echo "- Version bump needed: \`$NEEDS_BUMP\`"
+            echo "- Tag exists: \`$TAG_EXISTS\`"
+            echo "- Release exists: \`$RELEASE_EXISTS\`"
+            echo ""
+            echo "All checks above ran. Nothing was committed, tagged, released, or published."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit and push version bump
+        if: ${{ !inputs.dry_run && steps.state.outputs.release_exists == 'false' && steps.version.outputs.needs_bump == 'true' }}
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add pyproject.toml
+          git commit -m "Release v$VERSION"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+      - name: Create GitHub release
+        if: ${{ !inputs.dry_run && steps.state.outputs.release_exists == 'false' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          NOTES: ${{ inputs.notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          args=(--target "$(git rev-parse HEAD)" --title "$TAG")
+          if [ -n "$NOTES" ]; then
+            args+=(--notes "$NOTES")
+          else
+            args+=(--generate-notes)
+          fi
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"
+
+      - name: Dispatch PyPI publish
+        if: ${{ !inputs.dry_run && inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: gh workflow run python-publish.yml --ref "$TAG"

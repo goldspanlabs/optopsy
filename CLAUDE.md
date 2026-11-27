@@ -198,16 +198,24 @@ uv run pre-commit install --hook-type pre-push
 
 ## Releasing
 
-Publishing to PyPI is automated via GitHub Actions (`.github/workflows/python-publish.yml`) using trusted publishing. To release:
+Publishing to PyPI is automated via GitHub Actions (`.github/workflows/python-publish.yml`) using trusted publishing. Releases are cut with the **Release** workflow (`.github/workflows/release.yml`):
 
-1. Update `version` in `pyproject.toml` (e.g., `"2.3.0"`, or `"2.3.0b1"` for pre-releases)
-2. Commit and push the version bump
-3. Create a GitHub release via `gh release create`:
-   ```bash
-   # Stable release
-   gh release create v2.3.0 --title "v2.3.0" --notes "Release notes here"
+1. In GitHub Actions, run **Release** (workflow_dispatch). Inputs:
+   - `version` — exact version (e.g., `2.3.1`, `2.4.0b1`), or leave empty to bump
+   - `bump` — `patch` / `minor` / `major` when `version` is empty
+   - `prerelease` — mark the GitHub release as a pre-release (this does **not** stop the PyPI upload)
+   - `publish` — upload to PyPI; off by default, so tick it only for a real release
+   - `notes` — optional; auto-generated from merged PRs if empty
+   - `dry_run` — run every check and build the wheel, without committing, tagging, releasing, or publishing
+2. Before anything is pushed, the workflow bumps `pyproject.toml` and checks the bumped tree: CI must be green on the source commit, then lint, type check, the full test suite, and the wheel build run. The full test suite is then run against the wheel installed into a clean venv.
+3. If checks pass, it commits and pushes the bump to the branch you ran it on, creates the `v<version>` tag and GitHub release, and, if `publish` is ticked, dispatches `python-publish.yml` on that tag.
 
-   # Pre-release / beta
-   gh release create v2.3.0b1 --title "v2.3.0b1" --notes "Release notes here" --prerelease
-   ```
-4. The workflow automatically builds and publishes to PyPI — no API tokens needed locally
+Notes:
+- The release commit is pushed with `GITHUB_TOKEN`, which doesn't trigger CI, so the workflow runs the tests itself rather than relying on CI for that commit.
+- Releases created by the workflow's `GITHUB_TOKEN` do not trigger `release: published`, which is why publish is dispatched explicitly. A release created by hand still triggers publish automatically.
+- No API tokens are needed; PyPI uses trusted publishing.
+- Manual fallback: bump `pyproject.toml`, commit and push, then create the release against that commit (add `--prerelease` for betas). Pass `--target` explicitly, or the tag is created at the default branch's HEAD instead:
+  ```bash
+  git add pyproject.toml && git commit -m "Release v2.3.1" && git push origin HEAD
+  gh release create v2.3.1 --target "$(git rev-parse HEAD)" --generate-notes
+  ```
