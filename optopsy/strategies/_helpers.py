@@ -279,6 +279,7 @@ def _normalize_stock_data(
         tickers = df.columns.get_level_values(-1).unique()
         non_empty_tickers = [t for t in tickers if t != ""]
         if len(non_empty_tickers) > 1:
+            ticker_level_name = df.columns.names[-1]
             if isinstance(df.index, pd.DatetimeIndex) and df.index.name is None:
                 df.index = df.index.rename("date")
             # Multi-ticker yfinance DataFrame: stack ticker level into rows.
@@ -288,7 +289,12 @@ def _normalize_stock_data(
             else:
                 df = df.stack(level=-1).reset_index()
             # Rename stacked ticker column to underlying_symbol
-            if "Ticker" in df.columns:
+            ticker_col = (
+                ticker_level_name if ticker_level_name is not None else "level_1"
+            )
+            if ticker_col in df.columns:
+                df = df.rename(columns={ticker_col: "underlying_symbol"})
+            elif "Ticker" in df.columns:
                 df = df.rename(columns={"Ticker": "underlying_symbol"})
             elif "level_1" in df.columns:
                 df = df.rename(columns={"level_1": "underlying_symbol"})

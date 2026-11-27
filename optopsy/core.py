@@ -190,6 +190,24 @@ def _strategy_engine(
     )
 
 
+def _widen_numeric_columns(data: pd.DataFrame) -> None:
+    """Widen integer and nullable numeric columns to float64 in-place."""
+    for num_col in (
+        "strike",
+        "bid",
+        "ask",
+        "delta",
+        "implied_volatility",
+        "underlying_price",
+        "volume",
+        "open_interest",
+    ):
+        if num_col in data.columns and data[num_col].dtype != "float64":
+            data[num_col] = pd.to_numeric(data[num_col], errors="coerce").astype(
+                "float64"
+            )
+
+
 def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
     """
     Main entry point for processing option strategies.
@@ -209,11 +227,14 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
 
     # Normalize date columns once at the root so all downstream merges
     # (signal filtering, entry/exit matching) work regardless of source.
+    # Also widen integer/nullable numeric columns to float64 to prevent narrow
+    # integer overflow (e.g. uint8 bid/ask) or pd.NA arithmetic failures.
     data = data.copy()
     data["quote_date"] = normalize_dates(data["quote_date"])
     data["expiration"] = normalize_dates(data["expiration"])
     # Normalize option_type once so _calls/_puts avoid repeated .str.lower() calls
     data["option_type"] = data["option_type"].str.lower()
+    _widen_numeric_columns(data)
 
     leg_def = context["leg_def"]
     leg_deltas = [params.get(f"leg{i}_delta") for i in range(1, 5)]
@@ -234,6 +255,11 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
 
     needed_filters = {leg[1] for leg in leg_def}
     _prefiltered = {f: f(data) for f in needed_filters if f in (_calls, _puts)}
+
+    # For multi-leg strategies with exit_dte_tolerance > 0, retain all eligible
+    # exit candidates across legs so _merge_legs can match on a common exit date
+    # before selecting the closest exit per completed position.
+    select_closest_exit = len(leg_def) == 1 or params["exit_dte_tolerance"] == 0
 
     # Evaluate each leg independently
     leg_results = []
@@ -256,6 +282,7 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
             delta_interval=params["delta_interval"],
             entry_dates=params["entry_dates"],
             exit_dates=params["exit_dates"],
+            select_closest_exit=select_closest_exit,
         )
         leg_results.append(evaluated)
 
@@ -309,6 +336,38 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
             commission,
             params["per_leg_slippage"],
         )
+
+        if (
+            not select_closest_exit
+            and not result.empty
+            and "quote_date_exit" in result.columns
+        ):
+            pos_cols = [
+                c
+                for c in (
+                    "underlying_symbol",
+                    "expiration",
+                    "dte_entry",
+                    "strike",
+                    *(f"option_type_leg{i}" for i in range(1, len(leg_def) + 1)),
+                    *(f"strike_leg{i}" for i in range(1, len(leg_def) + 1)),
+                )
+                if c in result.columns
+            ]
+            actual_exit_dte = (result["expiration"] - result["quote_date_exit"]).dt.days
+            result = result.assign(
+                _exit_dte_diff=(actual_exit_dte - params["exit_dte"]).abs(),
+                _exit_dte_actual=actual_exit_dte,
+            )
+            result = (
+                result.sort_values(
+                    ["_exit_dte_diff", "_exit_dte_actual", "quote_date_exit"],
+                    kind="mergesort",
+                )
+                .drop_duplicates(subset=pos_cols, keep="first")
+                .drop(columns=["_exit_dte_diff", "_exit_dte_actual"])
+                .reset_index(drop=True)
+            )
 
     # Apply early exits (stop-loss / take-profit / max-hold-days) if configured
     if (
@@ -371,6 +430,7 @@ def _process_calendar_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFra
         expiration=normalize_dates(data["expiration"]),
         option_type=data["option_type"].str.lower(),
     )
+    _widen_numeric_columns(data)
     data = _assign_dte(data)
 
     # Filter by each leg's option type BEFORE delta selection (avoids evaluating

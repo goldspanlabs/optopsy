@@ -1599,3 +1599,125 @@ class TestSignalsRegressions:
             df, stock_data=yf_df, max_entry_dte=45, exit_dte=0, raw=True
         )
         assert len(res) == 1
+
+    def test_uint8_bid_ask_widened_without_overflow(self):
+        """Narrow integer bid/ask columns (e.g. uint8) must widen to float64 before midpoint math."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPX", "SPX"],
+                "option_type": ["call", "call"],
+                "expiration": pd.to_datetime([exp, exp]),
+                "quote_date": pd.to_datetime(["2020-01-02", exp]),
+                "strike": [100.0, 100.0],
+                "bid": pd.Series([200, 210], dtype="uint8"),
+                "ask": pd.Series([202, 212], dtype="uint8"),
+                "delta": [0.30, 0.40],
+            }
+        )
+        res = op.long_calls(df, max_entry_dte=45, exit_dte=0, slippage="mid", raw=True)
+        assert len(res) == 1
+        assert res["entry"].iloc[0] == pytest.approx(201.0)
+        assert res["exit"].iloc[0] == pytest.approx(211.0)
+
+    def test_compute_net_pct_change_handles_nullable_float64_with_pd_na(self):
+        """Nullable Float64 Series with pd.NA must map missing rows to np.nan without raising."""
+        from optopsy.pricing import _compute_net_pct_change
+
+        net_pnl = pd.Series([1.0, pd.NA], dtype="Float64")
+        entry_cost = pd.Series([2.0, 2.0], dtype="Float64")
+        out = _compute_net_pct_change(net_pnl, entry_cost)
+        assert out[0] == pytest.approx(0.5)
+        assert np.isnan(out[1])
+
+    def test_sustained_custom_historical_callback_isolated_per_symbol(self):
+        """sustained() must evaluate custom historical callbacks per chronologically sorted symbol."""
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": ["AAA", "BBB", "AAA", "BBB"],
+                "quote_date": pd.to_datetime(
+                    ["2020-01-03", "2020-01-02", "2020-01-02", "2020-01-03"]
+                ),
+                # AAA: 10 -> 8 (falling); BBB: 20 -> 15 (falling). Neither rises!
+                "close": [8.0, 20.0, 10.0, 15.0],
+            }
+        )
+
+        def _custom_up(g: pd.DataFrame) -> "pd.Series[bool]":
+            return g["close"].diff().gt(0)
+
+        mask = sustained(_custom_up, days=1)(df)
+        assert not mask.any()
+
+    def test_stock_data_multiindex_custom_ticker_level_name(self):
+        """Multi-ticker stock_data with MultiIndex levels ['Price', 'ticker'] must preserve symbols."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            [
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-02", 105.0, 2.0, 2.2, 0.30
+                ),
+                _make_option_row(
+                    "SPX", "call", exp, "2020-02-01", 105.0, 1.0, 1.2, 0.20
+                ),
+            ]
+        )
+        idx = pd.to_datetime(["2020-01-02", "2020-02-01"])
+        cols = pd.MultiIndex.from_tuples(
+            [("Close", "QQQ"), ("Close", "SPX"), ("Volume", "QQQ"), ("Volume", "SPX")],
+            names=["Price", "ticker"],
+        )
+        yf_df = pd.DataFrame(
+            [[200.0, 100.0, 2000, 1000], [205.0, 103.0, 2000, 1000]],
+            index=idx,
+            columns=cols,
+        )
+        res = op.covered_call(
+            df,
+            stock_data=yf_df,
+            max_entry_dte=45,
+            exit_dte=0,
+            slippage="mid",
+            raw=True,
+        )
+        assert len(res) == 1
+        assert res["total_entry_cost"].iloc[0] == pytest.approx(100.0 - 2.1)
+
+    def test_multi_leg_tolerance_matches_common_exit_date_across_legs(self):
+        """If leg1 has DTE=10 & 12 and leg2 only has DTE=12, tolerance=3 must match at DTE=12."""
+        exp = "2020-02-01"
+        df = pd.DataFrame(
+            [
+                # Entries at 2020-01-02 (DTE=30)
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-02", 100.0, 6.0, 6.2, 0.50
+                ),
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-02", 105.0, 3.0, 3.2, 0.30
+                ),
+                # Leg 1 has DTE=10 (2020-01-22) AND DTE=12 (2020-01-20)
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-22", 100.0, 7.0, 7.2, 0.55
+                ),
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-20", 100.0, 6.5, 6.7, 0.52
+                ),
+                # Leg 2 only has DTE=12 (2020-01-20)
+                _make_option_row(
+                    "SPX", "call", exp, "2020-01-20", 105.0, 2.5, 2.7, 0.28
+                ),
+            ]
+        )
+        res = op.long_call_spread(
+            df,
+            max_entry_dte=45,
+            exit_dte=10,
+            exit_dte_tolerance=3,
+            leg1_delta=_tr(0.50),
+            leg2_delta=_tr(0.30),
+            raw=True,
+        )
+        assert len(res) == 1
+        assert pd.Timestamp(res["quote_date_exit"].iloc[0]) == pd.Timestamp(
+            "2020-01-20"
+        )

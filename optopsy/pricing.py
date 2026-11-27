@@ -82,6 +82,13 @@ def _get_leg_quantity(leg: Tuple) -> int:
     return leg[2] if len(leg) > 2 else 1
 
 
+def _to_float_array(val: pd.Series | np.ndarray | float) -> np.ndarray:
+    """Convert Series/array/scalar to float64 ndarray, mapping pd.NA to np.nan."""
+    if isinstance(val, pd.Series):
+        return val.to_numpy(dtype=np.float64, na_value=np.nan)  # type: ignore[call-overload]
+    return np.asarray(val, dtype=float)
+
+
 def _compute_net_pct_change(
     net_pnl: pd.Series | np.ndarray,
     entry_cost: pd.Series | np.ndarray,
@@ -94,10 +101,10 @@ def _compute_net_pct_change(
     (strictly ``> 0`` when ``min_entry_threshold == 0.0``, or
     ``>= min_entry_threshold`` when a positive floor is supplied).
     """
-    adjusted_pnl = np.asarray(net_pnl, dtype=float) - (
-        np.asarray(commission_dollars, dtype=float) / _SHARES_PER_CONTRACT
+    adjusted_pnl = _to_float_array(net_pnl) - (
+        _to_float_array(commission_dollars) / _SHARES_PER_CONTRACT
     )
-    abs_entry = np.abs(np.asarray(entry_cost, dtype=float))
+    abs_entry = np.abs(_to_float_array(entry_cost))
     valid = (
         abs_entry >= min_entry_threshold if min_entry_threshold > 0 else abs_entry > 0
     )

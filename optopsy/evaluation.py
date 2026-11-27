@@ -26,23 +26,22 @@ from .filters import (
 
 
 def _get_exits(
-    data: pd.DataFrame, exit_dte: int, exit_dte_tolerance: int = 0
+    data: pd.DataFrame,
+    exit_dte: int,
+    exit_dte_tolerance: int = 0,
+    *,
+    select_closest: bool = True,
 ) -> pd.DataFrame:
     """
     Get exit rows from option data, optionally using tolerance-based DTE matching.
 
     When tolerance is 0 (default), only rows with exactly the target exit_dte are
     returned. When tolerance > 0, rows within [max(0, exit_dte - tolerance),
-    exit_dte + tolerance] are considered, and for each contract the row with DTE
-    closest to exit_dte is selected.
-
-    Args:
-        data: DataFrame containing option data with 'dte' column
-        exit_dte: Target DTE for exit
-        exit_dte_tolerance: Maximum allowed deviation from exit_dte (default 0)
-
-    Returns:
-        DataFrame of exit rows
+    exit_dte + tolerance] are considered. If *select_closest* is True (default),
+    for each contract the row with DTE closest to exit_dte is selected; when False,
+    all eligible exit rows (deduplicated per contract and quote_date) are returned
+    so multi-leg strategies can match on a common exit date before selecting the
+    closest exit.
     """
     contract_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
 
@@ -58,6 +57,12 @@ def _get_exits(
 
     if candidates.empty:
         return candidates
+
+    if not select_closest:
+        dedup_cols = contract_cols + (
+            ["quote_date"] if "quote_date" in candidates.columns else []
+        )
+        return candidates.drop_duplicates(subset=dedup_cols, keep="first")
 
     # For each contract, pick the row with DTE closest to exit_dte.
     # Sort deterministically by (dte, quote_date) so equidistant ties always
@@ -89,7 +94,10 @@ def _match_entries_exits(
         exit_candidates = _apply_signal_filter(exit_candidates, exit_dates)
 
     exits = _get_exits(
-        exit_candidates, kwargs["exit_dte"], kwargs.get("exit_dte_tolerance", 0)
+        exit_candidates,
+        kwargs["exit_dte"],
+        kwargs.get("exit_dte_tolerance", 0),
+        select_closest=kwargs.get("select_closest_exit", True),
     )
 
     merge_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
@@ -97,8 +105,13 @@ def _match_entries_exits(
     result = (
         entries.merge(right=exits, on=merge_cols, suffixes=("_entry", "_exit"))
         .assign(
-            entry=lambda r: (r["bid_entry"] + r["ask_entry"]) / 2,
-            exit=lambda r: (r["bid_exit"] + r["ask_exit"]) / 2,
+            entry=lambda r: (
+                (r["bid_entry"].astype("float64") + r["ask_entry"].astype("float64"))
+                / 2
+            ),
+            exit=lambda r: (
+                (r["bid_exit"].astype("float64") + r["ask_exit"].astype("float64")) / 2
+            ),
         )
         .pipe(_remove_invalid_evaluated_options)
     )
