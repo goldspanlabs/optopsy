@@ -2220,6 +2220,52 @@ class TestStrategyAndSimulatorSecondPassRegressions:
         assert len(combined) == 1
         assert combined["equity"].iloc[0] == pytest.approx(-2_000.0)
 
+    def test_diagonal_enforces_distinct_strikes_and_uses_distinct_default_deltas(
+        self, calendar_data
+    ):
+        """Diagonal spreads must enforce strike_leg1 != strike_leg2 and default leg2 to ATM."""
+        call_diag = op.long_call_diagonal(
+            calendar_data,
+            front_dte_min=20,
+            front_dte_max=40,
+            back_dte_min=50,
+            back_dte_max=70,
+            exit_dte=7,
+            raw=True,
+        )
+        assert len(call_diag) == 1
+        assert call_diag["strike_leg1"].iloc[0] == pytest.approx(215.0)
+        assert call_diag["strike_leg2"].iloc[0] == pytest.approx(212.5)
+        assert (call_diag["strike_leg1"] != call_diag["strike_leg2"]).all()
+
+        put_diag = op.long_put_diagonal(
+            calendar_data,
+            front_dte_min=20,
+            front_dte_max=40,
+            back_dte_min=50,
+            back_dte_max=70,
+            exit_dte=7,
+            raw=True,
+        )
+        assert len(put_diag) == 1
+        assert put_diag["strike_leg1"].iloc[0] == pytest.approx(210.0)
+        assert put_diag["strike_leg2"].iloc[0] == pytest.approx(212.5)
+        assert (put_diag["strike_leg1"] != put_diag["strike_leg2"]).all()
+
+        # Explicitly forcing both legs to the same strike must be filtered out
+        same_strike_diag = op.long_call_diagonal(
+            calendar_data,
+            front_dte_min=20,
+            front_dte_max=40,
+            back_dte_min=50,
+            back_dte_max=70,
+            exit_dte=7,
+            leg1_delta=_tr(0.35),
+            leg2_delta=_tr(0.38),
+            raw=True,
+        )
+        assert same_strike_diag.empty
+
 
 class TestSignalsSecondPassRegressions:
     """Regression tests for second-pass signal bugs."""

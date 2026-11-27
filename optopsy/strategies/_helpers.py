@@ -45,6 +45,7 @@ from ..pricing import (
 from ..rules import (
     _rule_butterfly_strikes,
     _rule_collar_strikes,
+    _rule_diagonal_spread,
     _rule_expiration_ordering,
     _rule_iron_butterfly_strikes,
     _rule_iron_condor_strikes,
@@ -887,7 +888,7 @@ def _calendar_spread(
     """
     kwargs.setdefault("leg1_delta", _DEFAULT_DELTA)
     if not same_strike:
-        kwargs.setdefault("leg2_delta", _DEFAULT_DELTA)
+        kwargs.setdefault("leg2_delta", _DEFAULT_ATM_DELTA)
 
     internal_cols = (
         calendar_spread_internal_cols if same_strike else diagonal_spread_internal_cols
@@ -901,7 +902,7 @@ def _calendar_spread(
         internal_cols=internal_cols,
         external_cols=external_cols,
         leg_def=leg_def,
-        rules=_rule_expiration_ordering,
+        rules=_rule_expiration_ordering if same_strike else _rule_diagonal_spread,
         same_strike=same_strike,
         params=kwargs,
     )
