@@ -2677,3 +2677,301 @@ class TestSignalsSecondPassRegressions:
         )
         assert len(snaps) == 1
         assert snaps["_mid"].iloc[0] == pytest.approx(6.1)
+
+
+# =============================================================================
+# 9. Coverage gaps: per-strike sustained, combinator propagation, exit ties,
+#    intermediate-snapshot branches, early-exit bail-outs
+# =============================================================================
+
+
+def _per_strike_flag_signal(data: pd.DataFrame) -> pd.Series:
+    """Per-strike test signal that reads a boolean ``flag`` column."""
+    return data["flag"].astype(bool)
+
+
+_per_strike_flag_signal.requires_per_strike = True  # type: ignore[attr-defined]
+
+
+class TestPerStrikeSignalCombinatorRegressions:
+    def _chain(self) -> pd.DataFrame:
+        """Two symbols x 4 dates x 2 strikes, flags set per (symbol, date, strike)."""
+        dates = pd.to_datetime(["2020-01-02", "2020-01-03", "2020-01-06", "2020-01-07"])
+        # (symbol, date_idx, strike) -> flag
+        flags = {
+            ("AAA", 0, 100): True,  # any() -> True
+            ("AAA", 0, 110): False,
+            ("AAA", 1, 100): False,
+            ("AAA", 1, 110): True,  # different strike than day 0 -> still "any"
+            ("AAA", 2, 100): False,
+            ("AAA", 2, 110): False,  # break in the run
+            ("AAA", 3, 100): True,
+            ("AAA", 3, 110): True,
+            # BBB is True only on its first day; must not inherit AAA's last True
+            ("BBB", 0, 100): True,
+            ("BBB", 0, 110): True,
+            ("BBB", 1, 100): False,
+            ("BBB", 1, 110): False,
+            ("BBB", 2, 100): False,
+            ("BBB", 2, 110): False,
+            ("BBB", 3, 100): False,
+            ("BBB", 3, 110): False,
+        }
+        rows = [
+            {
+                "underlying_symbol": sym,
+                "quote_date": dates[di],
+                "strike": strike,
+                "flag": flag,
+            }
+            for (sym, di, strike), flag in flags.items()
+        ]
+        return pd.DataFrame(rows)
+
+    def test_sustained_per_strike_collapses_daily_and_isolates_symbols(self):
+        df = self._chain()
+        sus = sustained(_per_strike_flag_signal, days=2)
+        assert getattr(sus, "requires_per_strike", False) is True
+
+        out = sus(df)
+        assert out.index.equals(df.index)
+        assert out.dtype == bool
+
+        got = {
+            (sym, d): bool(v)
+            for sym, d, v in zip(df["underlying_symbol"], df["quote_date"], out)
+        }
+        d = pd.to_datetime(["2020-01-02", "2020-01-03", "2020-01-06", "2020-01-07"])
+        # AAA: daily any() = [T, T, F, T] -> window-2 min = [F, T, F, F]
+        assert [got[("AAA", x)] for x in d] == [False, True, False, False]
+        # BBB: [T, F, F, F] -> never sustained (no leakage from AAA's last True)
+        assert [got[("BBB", x)] for x in d] == [False, False, False, False]
+
+    def test_sustained_per_strike_applies_to_every_strike_row_on_a_date(self):
+        df = self._chain()
+        out = sustained(_per_strike_flag_signal, days=2)(df)
+        day2 = (df["underlying_symbol"] == "AAA") & (
+            df["quote_date"] == pd.Timestamp("2020-01-03")
+        )
+        # Both strikes on the sustained date are marked, even though only one
+        # strike had the raw flag.
+        assert day2.sum() == 2
+        assert out[day2].all()
+
+    def test_sustained_per_strike_empty_data(self):
+        df = self._chain().iloc[0:0]
+        out = sustained(_per_strike_flag_signal, days=2)(df)
+        assert out.empty
+        assert out.dtype == bool
+
+    def test_sustained_non_per_strike_does_not_set_flag(self):
+        sus = sustained(daily_return_above(1.0), days=2)
+        assert not getattr(sus, "requires_per_strike", False)
+
+    @pytest.mark.parametrize("combine", [and_signals, op.or_signals])
+    def test_function_combinators_propagate_per_strike_flag(self, combine):
+        plain = daily_return_above(1.0)
+        assert getattr(combine(_per_strike_flag_signal, plain), "requires_per_strike")
+        assert not getattr(combine(plain, plain), "requires_per_strike", False)
+
+    def test_signal_operators_propagate_per_strike_flag(self):
+        per_strike = signal(_per_strike_flag_signal)
+        plain = signal(daily_return_above(1.0))
+        assert per_strike.requires_per_strike
+        assert (per_strike & plain).requires_per_strike
+        assert (plain | per_strike).requires_per_strike
+        assert not getattr(plain & plain, "requires_per_strike", False)
+
+    def test_signal_operators_evaluate_per_strike_operands(self):
+        df = self._chain()
+        always = signal(lambda data: pd.Series(True, index=data.index))
+        never = signal(lambda data: pd.Series(False, index=data.index))
+        per_strike = signal(_per_strike_flag_signal)
+
+        assert list((per_strike & always)(df)) == list(df["flag"])
+        assert not (per_strike & never)(df).any()
+        assert list((per_strike | never)(df)) == list(df["flag"])
+        # Short-circuit: left already all True
+        assert (always | per_strike)(df).all()
+
+
+class TestExitSelectionTieBreakRegressions:
+    def _candidates(self, order: list[int]) -> pd.DataFrame:
+        base = pd.DataFrame(
+            {
+                "underlying_symbol": "SPX",
+                "option_type": "call",
+                "expiration": pd.Timestamp("2020-02-21"),
+                "strike": 100.0,
+                "quote_date": pd.to_datetime(["2020-02-15", "2020-02-17"]),
+                "dte": [6, 4],  # both exactly 1 away from exit_dte=5
+                "bid": [1.0, 2.0],
+                "ask": [1.1, 2.1],
+            }
+        )
+        return base.iloc[order].reset_index(drop=True)
+
+    @pytest.mark.parametrize("order", [[0, 1], [1, 0]])
+    def test_equidistant_exit_ties_break_on_lowest_dte_regardless_of_row_order(
+        self, order
+    ):
+        from optopsy.evaluation import _get_exits
+
+        out = _get_exits(self._candidates(order), exit_dte=5, exit_dte_tolerance=1)
+        assert len(out) == 1
+        assert int(out["dte"].iloc[0]) == 4
+
+    def test_duplicate_input_index_labels_do_not_return_multiple_rows(self):
+        from optopsy.evaluation import _get_exits
+
+        df = self._candidates([0, 1])
+        df.index = pd.Index([7, 7])
+        out = _get_exits(df, exit_dte=5, exit_dte_tolerance=1)
+        assert len(out) == 1
+        assert int(out["dte"].iloc[0]) == 4
+
+
+class TestIntermediateSnapshotRegressions:
+    CONTRACT = ["underlying_symbol", "option_type", "expiration", "strike"]
+
+    def _data(self) -> pd.DataFrame:
+        dates = pd.to_datetime(
+            ["2020-01-02", "2020-01-03", "2020-01-06", "2020-01-07", "2020-01-08"]
+        )
+        rows = []
+        for d in dates:
+            rows.append(
+                _make_option_row("SPX", "call", "2020-01-08", d, 100.0, 1.0, 1.2, 0.5)
+            )
+        # Duplicate quote for one intermediate date must be collapsed
+        rows.append(
+            _make_option_row(
+                "SPX", "call", "2020-01-08", dates[1], 100.0, 9.0, 9.2, 0.5
+            )
+        )
+        return pd.DataFrame(rows)
+
+    def _trades(self, entry: str = "2020-01-02", exit_: str = "2020-01-08"):
+        return pd.DataFrame(
+            {
+                "_trade_id": [0],
+                "underlying_symbol": ["SPX"],
+                "option_type": ["call"],
+                "expiration": [pd.Timestamp("2020-01-08")],
+                "strike": [100.0],
+                "quote_date_entry": [pd.Timestamp(entry)],
+                "exit_date": [pd.Timestamp(exit_)],
+            }
+        )
+
+    def test_planned_exit_bounds_and_dedup(self):
+        from optopsy.exits import _get_intermediate_snapshots
+
+        out = _get_intermediate_snapshots(
+            self._data(),
+            self._trades(),
+            self.CONTRACT,
+            "quote_date_entry",
+            exit_date_col="exit_date",
+        )
+        # strictly between 01-02 and 01-08, one row per date
+        assert list(out["quote_date"]) == list(
+            pd.to_datetime(["2020-01-03", "2020-01-06", "2020-01-07"])
+        )
+        # first quote kept for the duplicated date (mid 1.1, not 9.1)
+        assert out["_mid"].iloc[0] == pytest.approx(1.1)
+
+    def test_fallback_uses_contract_max_date_when_no_planned_exit(self):
+        from optopsy.exits import _get_intermediate_snapshots
+
+        out = _get_intermediate_snapshots(
+            self._data(), self._trades(), self.CONTRACT, "quote_date_entry"
+        )
+        assert list(out["quote_date"]) == list(
+            pd.to_datetime(["2020-01-03", "2020-01-06", "2020-01-07"])
+        )
+
+    def test_fallback_accepts_precomputed_max_dates(self):
+        from optopsy.exits import _get_intermediate_snapshots
+
+        max_dates = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPX"],
+                "option_type": ["call"],
+                "expiration": [pd.Timestamp("2020-01-08")],
+                "strike": [100.0],
+                "_max_date": [pd.Timestamp("2020-01-06")],
+            }
+        )
+        out = _get_intermediate_snapshots(
+            self._data(),
+            self._trades(),
+            self.CONTRACT,
+            "quote_date_entry",
+            max_dates=max_dates,
+        )
+        assert list(out["quote_date"]) == list(pd.to_datetime(["2020-01-03"]))
+
+    @pytest.mark.parametrize(
+        "case",
+        ["no_trades", "no_contract_cols", "no_match", "nothing_after_entry"],
+    )
+    def test_empty_results_keep_schema(self, case):
+        from optopsy.exits import _get_intermediate_snapshots
+
+        data, trades, cols = self._data(), self._trades(), self.CONTRACT
+        if case == "no_trades":
+            trades = trades.iloc[0:0]
+        elif case == "no_contract_cols":
+            cols = ["not_a_column"]
+        elif case == "no_match":
+            trades["strike"] = 999.0
+        elif case == "nothing_after_entry":
+            trades["quote_date_entry"] = pd.Timestamp("2020-01-08")
+
+        out = _get_intermediate_snapshots(
+            data, trades, cols, "quote_date_entry", exit_date_col="exit_date"
+        )
+        assert out.empty
+        assert list(out.columns) == ["_trade_id", "quote_date", "_mid"]
+
+
+class TestEarlyExitBailoutRegressions:
+    def _chain(self) -> pd.DataFrame:
+        dates = pd.to_datetime(["2020-01-02", "2020-01-03", "2020-01-08"])
+        mids = [(1.0, 1.2), (0.1, 0.2), (0.1, 0.2)]
+        return pd.DataFrame(
+            [
+                _make_option_row("SPX", "call", "2020-01-08", d, 100.0, bid, ask, 0.5)
+                for d, (bid, ask) in zip(dates, mids)
+            ]
+        )
+
+    def test_multi_leg_without_expiration_or_entry_columns_returns_result_unchanged(
+        self,
+    ):
+        from optopsy.exits import _apply_multi_leg_exits
+        from optopsy.strategies._helpers import Side
+
+        result = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPX"],
+                "strike": [100.0],
+                "total_entry_cost": [1.1],
+                "total_exit_proceeds": [0.15],
+                "pct_change": [-0.86],
+            }
+        )
+        leg_def = [(Side.long, lambda d: d, 1), (Side.short, lambda d: d, 1)]
+        before = result.copy()
+        out = _apply_multi_leg_exits(
+            result.copy(),
+            self._chain(),
+            leg_def,
+            -0.5,
+            None,
+        )
+        # No expiration/entry columns -> nothing to look up; trades unchanged
+        # and the temporary helper column must not leak.
+        assert "_trade_id" not in out.columns
+        pd.testing.assert_frame_equal(out[before.columns], before)
