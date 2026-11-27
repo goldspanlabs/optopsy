@@ -151,30 +151,42 @@ jobs:
           echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
 
       - name: Require green CI on the source commit
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           # The release commit is pushed with GITHUB_TOKEN, which does not trigger
-          # CI. So CI is checked on the commit it is built from ($GITHUB_SHA).
-          endpoint="repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100"
-          if ! total=$(gh api "$endpoint" --jq '.total_count'); then
-            echo "::error::Could not read check runs for $GITHUB_SHA"
+          # CI. On a retry after the bump was already pushed, HEAD is that bump
+          # commit, so CI is checked on the commit it was built from (its parent).
+          source_sha="$GITHUB_SHA"
+          subject=$(git log -1 --format=%s "$GITHUB_SHA")
+          author=$(git log -1 --format=%an "$GITHUB_SHA")
+          if [ "$subject" = "Release v$VERSION" ] && [ "$author" = "github-actions[bot]" ]; then
+            source_sha=$(git rev-parse "$GITHUB_SHA^")
+            echo "Bump commit detected; checking CI on its parent $source_sha"
+          fi
+
+          # Only the ci.yml workflow is checked, so this job's own in-progress
+          # check run does not block itself.
+          if ! latest=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$source_sha&per_page=20" \
+              --jq '[.workflow_runs[] | {status, conclusion, created_at}] | sort_by(.created_at) | last // empty'); then
+            echo "::error::Could not read CI runs for $source_sha"
             exit 1
           fi
-          if [ "$total" -eq 0 ]; then
-            echo "::error::No check runs found for $GITHUB_SHA"
+          if [ -z "$latest" ]; then
+            echo "::error::No CI run found for $source_sha"
             exit 1
           fi
-          bad=$(gh api "$endpoint" --jq '.check_runs[] | select(.status != "completed" or ((.conclusion == "success" or .conclusion == "skipped" or .conclusion == "neutral") | not)) | "\(.name): \(.status)/\(.conclusion)"')
-          if [ -n "$bad" ]; then
-            echo "::error::CI is not green on $GITHUB_SHA:"
-            echo "$bad"
+          status=$(jq -r '.status' <<< "$latest")
+          conclusion=$(jq -r '.conclusion' <<< "$latest")
+          if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+            echo "::error::Latest CI run for $source_sha is $status/$conclusion"
             exit 1
           fi
 
       - name: Apply version to pyproject.toml
-        if: ${{ steps.state.outputs.release_exists == 'false' && steps.version.outputs.needs_bump == 'true' }}
+        if: ${{ (steps.state.outputs.release_exists == 'false' || inputs.dry_run) && steps.version.outputs.needs_bump == 'true' }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -182,34 +194,34 @@ jobs:
           grep -q "^version = \"$VERSION\"" pyproject.toml
 
       - name: Set up uv
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         uses: astral-sh/setup-uv@v7
 
       - name: Set up Python
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         run: uv python install 3.13
 
       - name: Install dependencies
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         run: uv sync --extra data --extra ui
 
       - name: Lint and type check
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         run: |
           uv run ruff format --check optopsy/ tests/
           uv run ruff check optopsy/ tests/
           uv run ty check optopsy/
 
       - name: Run test suite
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         run: uv run pytest tests/ -v
 
       - name: Build wheel and sdist
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         run: uv build
 
       - name: Test the built wheel in a clean environment
-        if: ${{ steps.state.outputs.release_exists == 'false' }}
+        if: ${{ steps.state.outputs.release_exists == 'false' || inputs.dry_run }}
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -229,8 +241,11 @@ jobs:
           PY
 
           # Run the full suite against the installed package, not the source tree.
+          # Copy the test-only support files too: tests load ../samples and the root conftest.
           mkdir -p "$RUNNER_TEMP/wheel-check"
           cp -r "$GITHUB_WORKSPACE/tests" "$RUNNER_TEMP/wheel-check/tests"
+          cp -r "$GITHUB_WORKSPACE/samples" "$RUNNER_TEMP/wheel-check/samples"
+          cp "$GITHUB_WORKSPACE/conftest.py" "$RUNNER_TEMP/wheel-check/conftest.py"
           cd "$RUNNER_TEMP/wheel-check"
           "$RUNNER_TEMP/wheel-venv/bin/python" -m pytest tests -q -p no:cacheprovider
 
