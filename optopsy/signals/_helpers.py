@@ -21,11 +21,19 @@ SignalFunc = Callable[[pd.DataFrame], "pd.Series[bool]"]
 def _groupby_symbol(
     data: pd.DataFrame,
     compute_group: Callable[[pd.DataFrame], "pd.Series[bool]"],
+    *,
+    reset_non_monotonic_index: bool = False,
 ) -> "pd.Series[bool]":
     """Apply *compute_group* per underlying_symbol and concatenate results.
 
     Handles the empty-DataFrame, empty-groups (all-NA symbols), and unsorted
     ``quote_date`` edge cases that every per-symbol signal needs.
+
+    When *reset_non_monotonic_index* is True (used by pandas-ta-backed built-in
+    signal builders), non-monotonic group indices are temporarily reset to a
+    ``RangeIndex`` so pandas-ta index alignment cannot re-sort chronologically
+    ordered bars. User-defined callbacks (e.g. via ``sustained()``) default to
+    False so original index labels are preserved.
     """
     if data.empty:
         return pd.Series(False, index=data.index, dtype=bool)
@@ -39,7 +47,7 @@ def _groupby_symbol(
         ):
             order = group["quote_date"].to_numpy().argsort(kind="mergesort")
             group = group.iloc[order]
-        if not group.index.is_monotonic_increasing:
+        if reset_non_monotonic_index and not group.index.is_monotonic_increasing:
             orig_index = group.index
             res = compute_group(group.reset_index(drop=True))
             return pd.Series(res.to_numpy(dtype=bool), index=orig_index, dtype=bool)
@@ -91,7 +99,7 @@ def _per_symbol_signal(
                 return pd.Series(False, index=group.index)
             return compare_fn(prices, indicator).fillna(False)
 
-        return _groupby_symbol(data, _compute_group)
+        return _groupby_symbol(data, _compute_group, reset_non_monotonic_index=True)
 
     return signal
 
@@ -124,7 +132,7 @@ def _crossover_signal(
             cross = cur_op(line_a, line_b) & prev_op(line_a.shift(1), line_b.shift(1))
             return cross.fillna(False)
 
-        return _groupby_symbol(data, _compute_group)
+        return _groupby_symbol(data, _compute_group, reset_non_monotonic_index=True)
 
     return _signal
 
@@ -156,7 +164,7 @@ def _ohlcv_signal(
                 return pd.Series(False, index=group.index)
             return compare_fn(indicator).fillna(False)
 
-        return _groupby_symbol(data, _compute_group)
+        return _groupby_symbol(data, _compute_group, reset_non_monotonic_index=True)
 
     return signal
 
@@ -185,7 +193,7 @@ def _ohlcv_crossover_signal(
             cross = cur_op(line_a, line_b) & prev_op(line_a.shift(1), line_b.shift(1))
             return cross.fillna(False)
 
-        return _groupby_symbol(data, _compute_group)
+        return _groupby_symbol(data, _compute_group, reset_non_monotonic_index=True)
 
     return _signal
 
@@ -223,7 +231,7 @@ def _band_signal(
                 return pd.Series(False, index=group.index)
             return cmp(prices, band.fillna(fill_val)).fillna(False)
 
-        return _groupby_symbol(data, _compute_group)
+        return _groupby_symbol(data, _compute_group, reset_non_monotonic_index=True)
 
     return _signal
 
@@ -256,7 +264,7 @@ def _direction_signal(
             changed = (direction == target) & (direction.shift(1) == -target)
             return changed.fillna(False)
 
-        return _groupby_symbol(data, _compute_group)
+        return _groupby_symbol(data, _compute_group, reset_non_monotonic_index=True)
 
     return _signal
 

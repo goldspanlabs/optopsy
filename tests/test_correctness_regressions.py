@@ -2284,6 +2284,44 @@ class TestStrategyAndSimulatorSecondPassRegressions:
             res.trade_log["equity"].iloc[-1]
         )
 
+    def test_simulate_portfolio_intraday_exit_aggregates_into_daily_equity(self):
+        """Intraday exit timestamps must aggregate into daily bins without producing NaN."""
+
+        def intraday_strategy(_data, **_kwargs):
+            return pd.DataFrame(
+                {
+                    "underlying_symbol": ["SPY"],
+                    "quote_date_entry": [pd.Timestamp("2024-01-02 09:30:00")],
+                    "quote_date_exit": [pd.Timestamp("2024-01-10 16:00:00")],
+                    "option_type": ["call"],
+                    "expiration": [pd.Timestamp("2024-01-19")],
+                    "dte_entry": [17],
+                    "strike": [100.0],
+                    "entry": [2.0],
+                    "exit": [3.5],
+                    "pct_change": [0.75],
+                    "delta_entry": [0.30],
+                }
+            )
+
+        res = op.simulate_portfolio(
+            legs=[
+                {
+                    "name": "intraday",
+                    "data": pd.DataFrame({"x": [1]}),
+                    "strategy": intraday_strategy,
+                    "weight": 1.0,
+                }
+            ],
+            capital=10_000.0,
+        )
+        assert not res.equity_curve.isna().any()
+        assert len(res.equity_curve) == 1
+        assert res.equity_curve.index[0] == pd.Timestamp("2024-01-10")
+        assert res.equity_curve.iloc[0] == pytest.approx(
+            res.trade_log["equity"].iloc[-1]
+        )
+
     def test_diagonal_enforces_distinct_strikes_and_uses_distinct_default_deltas(
         self, calendar_data
     ):
@@ -2540,3 +2578,27 @@ class TestSignalsSecondPassRegressions:
 
         res_ppo_swapped = op.ppo_cross_above(26, 12, 9)(df)
         assert res_ppo_swapped.tolist() == res_ppo_int.tolist()
+
+    def test_sustained_preserves_non_monotonic_index_labels_for_user_callbacks(self):
+        """sustained() must preserve non-monotonic index labels for user-defined callbacks."""
+        df = pd.DataFrame(
+            {
+                "underlying_symbol": ["SPY", "SPY", "SPY"],
+                "quote_date": pd.to_datetime(
+                    ["2024-01-02", "2024-01-03", "2024-01-04"]
+                ),
+                "close": [100.0, 101.0, 102.0],
+            },
+            index=[20, 10, 30],
+        )
+        external_flags = pd.Series({20: False, 10: True, 30: True})
+        seen_indices: list[list[int]] = []
+
+        def lookup_callback(g: pd.DataFrame) -> "pd.Series[bool]":
+            seen_indices.append(g.index.tolist())
+            return external_flags.loc[g.index]
+
+        out = sustained(lookup_callback, days=2)(df)
+        assert seen_indices == [[20, 10, 30]]
+        assert out.index.tolist() == [20, 10, 30]
+        assert out.tolist() == [False, False, True]

@@ -1107,6 +1107,6 @@ def _build_portfolio_equity_curve(combined_log: pd.DataFrame) -> pd.Series:
 
     daily = combined_log.groupby("exit_date")["equity"].last()
     daily.index = pd.to_datetime(daily.index)
-    daily = daily.sort_index().resample("D").ffill()
+    daily = daily.sort_index().resample("D").last().ffill()
     daily.name = "equity"
     return daily
