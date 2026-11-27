@@ -927,12 +927,11 @@ class TestTASignalE2E:
 
         assert len(results_ohlcv) > 0
         assert len(results_close) > 0
-        # OHLCV data should produce at least as many results as close-only
-        assert len(results_ohlcv) >= len(results_close)
 
-        # OHLCV includes bar 160 that close-only misses
+        # Real high/low changes the true range and therefore produces different
+        # causal ATR signals than close-only data.
         ohlcv_dates = set(results_ohlcv["quote_date_entry"].unique())
         close_dates = set(results_close["quote_date_entry"].unique())
-        assert close_dates < ohlcv_dates, (
-            "Expected close-only to be a strict subset of OHLCV dates"
+        assert ohlcv_dates != close_dates, (
+            "Expected OHLCV high/low to produce different ATR signal dates than close-only"
         )

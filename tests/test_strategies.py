@@ -1863,12 +1863,12 @@ def test_calendar_exit_dte_tolerance_zero_no_match(calendar_data):
 
 
 def test_duplicate_rows_handled(data):
-    """Duplicate rows in input data should not crash the pipeline."""
+    """Duplicate rows in input data should not crash or fan out into duplicate trades."""
+    baseline = long_calls(data, raw=True)
     duplicated = pd.concat([data, data], ignore_index=True)
     results = long_calls(duplicated, raw=True)
     assert isinstance(results, pd.DataFrame)
-    # Should have more results due to duplicated entries
-    assert len(results) >= 2
+    assert len(results) == len(baseline)
 
 
 # =============================================================================

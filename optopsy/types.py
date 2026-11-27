@@ -25,10 +25,10 @@ class Commission(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    per_contract: float = Field(0.0, ge=0)
-    per_share: float = Field(0.0, ge=0)
-    base_fee: float = Field(0.0, ge=0)
-    min_fee: float = Field(0.0, ge=0)
+    per_contract: float = Field(0.0, ge=0, allow_inf_nan=False)
+    per_share: float = Field(0.0, ge=0, allow_inf_nan=False)
+    base_fee: float = Field(0.0, ge=0, allow_inf_nan=False)
+    min_fee: float = Field(0.0, ge=0, allow_inf_nan=False)
 
 
 class TargetRange(BaseModel):
@@ -40,9 +40,9 @@ class TargetRange(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    target: float = Field(gt=0, le=1)
-    min: float = Field(gt=0, le=1)
-    max: float = Field(gt=0, le=1)
+    target: float = Field(gt=0, le=1, allow_inf_nan=False)
+    min: float = Field(gt=0, le=1, allow_inf_nan=False)
+    max: float = Field(gt=0, le=1, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def check_ordering(self):
@@ -138,10 +138,10 @@ class StrategyParams(BaseModel):
     dte_interval: int = Field(7, gt=0, strict=True)
 
     # Filtering parameters (strict float enforced by validate_strict_float below)
-    min_bid_ask: float = Field(0.05, gt=0)
+    min_bid_ask: float = Field(0.05, gt=0, allow_inf_nan=False)
 
     # Delta grouping interval (always-on, non-optional)
-    delta_interval: float = Field(0.05, gt=0)
+    delta_interval: float = Field(0.05, gt=0, allow_inf_nan=False)
 
     # Per-leg delta targeting (optional)
     leg1_delta: Optional[TargetRange] = None
@@ -155,9 +155,9 @@ class StrategyParams(BaseModel):
 
     # Slippage settings
     slippage: Literal["mid", "spread", "liquidity", "per_leg"] = "spread"
-    fill_ratio: Union[int, float] = Field(0.5, ge=0, le=1)
+    fill_ratio: Union[int, float] = Field(0.5, ge=0, le=1, allow_inf_nan=False)
     reference_volume: int = Field(1000, gt=0, strict=True)
-    per_leg_slippage: Union[int, float] = Field(0.073, ge=0, le=1)
+    per_leg_slippage: Union[int, float] = Field(0.073, ge=0, le=1, allow_inf_nan=False)
 
     # Side (optional — not consumed by core pipeline, reserved for future use)
     side: Optional[Literal["long", "short"]] = None
@@ -166,8 +166,8 @@ class StrategyParams(BaseModel):
     commission: Optional[Union[Commission, float]] = None
 
     # Early exit thresholds (P&L-based)
-    stop_loss: Optional[float] = Field(None, lt=0)
-    take_profit: Optional[float] = Field(None, gt=0)
+    stop_loss: Optional[float] = Field(None, lt=0, allow_inf_nan=False)
+    take_profit: Optional[float] = Field(None, gt=0, allow_inf_nan=False)
 
     # Time-based early exit
     max_hold_days: Optional[int] = Field(None, gt=0, strict=True)
@@ -283,13 +283,19 @@ class CalendarStrategyParams(StrategyParams):
                 f"back_dte_min ({self.back_dte_min}) to avoid overlapping ranges"
             )
 
+        if self.exit_dte >= self.front_dte_max:
+            raise ValueError(
+                f"exit_dte ({self.exit_dte}) must be < "
+                f"front_dte_max ({self.front_dte_max})"
+            )
+
         return self
 
 
 class SimulatorParams(BaseModel):
     """Pydantic model for validating simulator parameters."""
 
-    capital: Union[int, float] = Field(gt=0)
+    capital: Union[int, float] = Field(gt=0, allow_inf_nan=False)
     quantity: int = Field(gt=0, strict=True)
     max_positions: int = Field(gt=0, strict=True)
     multiplier: int = Field(gt=0, strict=True)

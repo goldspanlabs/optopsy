@@ -35,6 +35,7 @@ evaluated_cols: List[str] = [
 single_strike_internal_cols: List[str] = [
     "underlying_symbol",
     "quote_date_entry",
+    "quote_date_exit",
     "option_type",
     "expiration",
     "dte_entry",
@@ -49,6 +50,7 @@ single_strike_internal_cols: List[str] = [
 straddle_internal_cols: List[str] = [
     "underlying_symbol",
     "expiration",
+    "quote_date_exit",
     "dte_entry",
     "option_type_leg1",
     "option_type_leg2",
@@ -64,6 +66,7 @@ straddle_internal_cols: List[str] = [
 double_strike_internal_cols: List[str] = [
     "underlying_symbol",
     "expiration",
+    "quote_date_exit",
     "dte_entry",
     "option_type_leg1",
     "strike_leg1",
@@ -79,6 +82,7 @@ double_strike_internal_cols: List[str] = [
 triple_strike_internal_cols: List[str] = [
     "underlying_symbol",
     "expiration",
+    "quote_date_exit",
     "dte_entry",
     "dte_range",
     "option_type_leg1",
@@ -98,6 +102,7 @@ triple_strike_internal_cols: List[str] = [
 quadruple_strike_internal_cols: List[str] = [
     "underlying_symbol",
     "expiration",
+    "quote_date_exit",
     "dte_entry",
     "dte_range",
     "option_type_leg1",
@@ -145,6 +150,7 @@ calendar_spread_internal_cols: List[str] = [
     "strike",
     "expiration_leg1",
     "expiration_leg2",
+    "exit_date",
     "dte_entry_leg1",
     "dte_entry_leg2",
     "entry_leg1",
@@ -170,6 +176,7 @@ diagonal_spread_internal_cols: List[str] = [
     "strike_leg2",
     "expiration_leg1",
     "expiration_leg2",
+    "exit_date",
     "dte_entry_leg1",
     "dte_entry_leg2",
     "entry_leg1",

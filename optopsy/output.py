@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .definitions import describe_cols
+from .filters import _cut_options_by_delta
 
 
 def _group_by_intervals(
@@ -49,18 +50,25 @@ def _group_by_intervals(
     gross_wins = _g["_win_amt"].sum()
     gross_losses = _g["_loss_amt"].sum()
 
+    safe_valid = np.where(valid_counts > 0, valid_counts, 1)
     grouped_dataset["win_rate"] = np.where(
-        valid_counts > 0, win_counts / valid_counts, np.nan
+        valid_counts > 0, win_counts / safe_valid, np.nan
     )
+    safe_losses = np.where(gross_losses != 0, gross_losses, 1.0)
     grouped_dataset["profit_factor"] = np.where(
-        gross_losses != 0,
-        np.abs(gross_wins / gross_losses),
-        np.where(gross_wins > 0, np.inf, 0.0),
+        valid_counts == 0,
+        np.nan,
+        np.where(
+            gross_losses != 0,
+            np.abs(gross_wins / safe_losses),
+            np.where(gross_wins > 0, np.inf, 0.0),
+        ),
     )
 
-    # if any non-count columns return NaN remove the row
+    # If all non-count statistical columns are NaN (e.g. groups where every
+    # trade had NaN pct_change), drop the row when drop_na is enabled.
     if drop_na:
-        subset = [col for col in grouped_dataset.columns if "_count" not in col]
+        subset = [col for col in grouped_dataset.columns if col != "count"]
         grouped_dataset = grouped_dataset.dropna(subset=subset, how="all")
 
     return grouped_dataset
@@ -159,17 +167,20 @@ def _format_calendar_output(
     data["dte_range_leg1"] = pd.cut(data["dte_entry_leg1"], front_dte_intervals)
     data["dte_range_leg2"] = pd.cut(data["dte_entry_leg2"], back_dte_intervals)
 
-    # Create delta ranges
+    # Create delta ranges (reuse shared helper for consistent edge precision
+    # and include_lowest=True handling)
     delta_interval = params["delta_interval"]
-    delta_intervals = np.round(
-        np.arange(-1.0, 1.0 + delta_interval, delta_interval), 2
-    ).tolist()
-
     if same_strike:
-        data["delta_range"] = pd.cut(data["delta_leg1"], delta_intervals)
+        data = _cut_options_by_delta(
+            data, delta_interval, col="delta_leg1", out_col="delta_range"
+        )
     else:
-        data["delta_range_leg1"] = pd.cut(data["delta_leg1"], delta_intervals)
-        data["delta_range_leg2"] = pd.cut(data["delta_leg2"], delta_intervals)
+        data = _cut_options_by_delta(
+            data, delta_interval, col="delta_leg1", out_col="delta_range_leg1"
+        )
+        data = _cut_options_by_delta(
+            data, delta_interval, col="delta_leg2", out_col="delta_range_leg2"
+        )
 
     return data.pipe(
         _group_by_intervals, external_cols, params["drop_nan"]

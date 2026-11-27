@@ -14,6 +14,7 @@ from optopsy.strategies._helpers import (
     _DEFAULT_DELTA,
     _DEFAULT_ITM_WING_DELTA,
     _DEFAULT_OTM_DELTA,
+    _DEFAULT_OTM_WING_DELTA,
 )
 
 from ._executor import _register, _require_dataset
@@ -359,23 +360,30 @@ def _handle_suggest_strategy_params(
             )
     elif strategy_name and "butterfly" in strategy_name:
         if has_delta:
-            recommended["leg1_delta"] = _DEFAULT_ITM_WING_DELTA
-            recommended["leg2_delta"] = _DEFAULT_ATM_DELTA
-            recommended["leg3_delta"] = _DEFAULT_OTM_DELTA
-            strategy_note = (
-                "Butterfly — ITM wing at 0.40, body at 0.50 (ATM), OTM wing at 0.10."
-            )
+            if "put" in strategy_name:
+                recommended["leg1_delta"] = _DEFAULT_OTM_WING_DELTA
+                recommended["leg2_delta"] = _DEFAULT_ATM_DELTA
+                recommended["leg3_delta"] = _DEFAULT_ITM_WING_DELTA
+                strategy_note = "Put butterfly — OTM wing at 0.30, body at 0.50 (ATM), ITM wing at 0.70."
+            else:
+                recommended["leg1_delta"] = _DEFAULT_ITM_WING_DELTA
+                recommended["leg2_delta"] = _DEFAULT_ATM_DELTA
+                recommended["leg3_delta"] = _DEFAULT_OTM_WING_DELTA
+                strategy_note = "Butterfly — ITM wing at 0.70, body at 0.50 (ATM), OTM wing at 0.30."
         else:
             strategy_note = (
                 "Butterfly strategy — uses OTM% filtering without delta data."
             )
     elif strategy_name and "spread" in strategy_name:
         if has_delta:
-            recommended["leg1_delta"] = _DEFAULT_ATM_DELTA
-            recommended["leg2_delta"] = _DEFAULT_OTM_DELTA
-            strategy_note = (
-                "Vertical spread — long leg at 0.50 (ATM), short leg at 0.10 (OTM)."
-            )
+            if "put" in strategy_name:
+                recommended["leg1_delta"] = _DEFAULT_OTM_DELTA
+                recommended["leg2_delta"] = _DEFAULT_ATM_DELTA
+                strategy_note = "Put vertical spread — lower strike at 0.10 (OTM), higher strike at 0.50 (ATM)."
+            else:
+                recommended["leg1_delta"] = _DEFAULT_ATM_DELTA
+                recommended["leg2_delta"] = _DEFAULT_OTM_DELTA
+                strategy_note = "Vertical spread — lower strike at 0.50 (ATM), higher strike at 0.10 (OTM)."
         else:
             strategy_note = "Vertical spread — uses OTM% filtering without delta data."
     elif strategy_name and "straddle" in strategy_name:

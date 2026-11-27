@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from functools import reduce
+from functools import partial, reduce
 from typing import Any, Callable, Literal, Union
 
 import numpy as np
@@ -218,18 +218,41 @@ def _normalise_trades(
     else:
         df["exit_type"] = "expiration"
 
-    if exit_dte > 0:
-        dte_based = df["expiration"] - pd.Timedelta(days=exit_dte)
-        if "_early_exit_date" in raw.columns:
-            early = pd.to_datetime(raw["_early_exit_date"].values)
-            has_early = pd.notna(early)
-            df["exit_date"] = np.where(has_early, early, dte_based.values)
-        else:
-            df["exit_date"] = dte_based
-    elif "_early_exit_date" in raw.columns:
-        early = pd.to_datetime(raw["_early_exit_date"].values)
+    # Prefer explicit exit date columns when present in raw output; otherwise
+    # derive from expiration - exit_dte. Early exit dates always take priority.
+    explicit_exit_col = next(
+        (
+            col
+            for col in ("quote_date_exit", "quote_date_exit_leg1", "exit_date")
+            if col in raw.columns
+        ),
+        None,
+    )
+    fallback_exit = (
+        pd.to_datetime(df["expiration"] - pd.Timedelta(days=exit_dte))
+        if exit_dte > 0
+        else pd.to_datetime(df["exit_date"])
+    )
+    if explicit_exit_col is not None:
+        matched_exit = pd.to_datetime(raw[explicit_exit_col].to_numpy())
+        base_exit = pd.to_datetime(
+            np.where(
+                pd.notna(matched_exit),
+                matched_exit.to_numpy(),
+                fallback_exit.to_numpy(),
+            )
+        )
+    else:
+        base_exit = fallback_exit
+
+    if "_early_exit_date" in raw.columns:
+        early = pd.to_datetime(raw["_early_exit_date"].to_numpy())
         has_early = pd.notna(early)
-        df["exit_date"] = np.where(has_early, early, np.asarray(df["exit_date"]))
+        df["exit_date"] = pd.to_datetime(
+            np.where(has_early, early.to_numpy(), base_exit.to_numpy())
+        )
+    else:
+        df["exit_date"] = base_exit.to_numpy()
 
     df["commission"] = (
         raw["total_commission"].fillna(0.0).values
@@ -349,12 +372,22 @@ def _select_one(candidates: pd.DataFrame, idx: Any) -> pd.Series:
     return result
 
 
+def _select_by_extremum(
+    candidates: pd.DataFrame, metric: pd.Series, *, pick_max: bool = False
+) -> pd.Series:
+    """Select the candidate row minimizing (or maximizing) *metric*, guarding all-NaN."""
+    if not metric.notna().any():
+        return candidates.iloc[0]
+    idx = metric.idxmax() if pick_max else metric.idxmin()
+    return _select_one(candidates, idx)
+
+
 def _select_nearest(candidates: pd.DataFrame) -> pd.Series:
     """Select the trade closest to ATM (delta closest to 0.50)."""
-    for delta_col in ("delta_entry", "delta_entry_leg1"):
-        if delta_col in candidates.columns:
-            return _select_one(
-                candidates, (candidates[delta_col].abs() - 0.50).abs().idxmin()
+    for delta_col in ("delta_entry", "delta_entry_leg1", "delta_leg1"):
+        if delta_col in candidates.columns and candidates[delta_col].notna().any():
+            return _select_by_extremum(
+                candidates, (candidates[delta_col].abs() - 0.50).abs()
             )
 
     # Fallback: use strike - underlying_price distance
@@ -371,7 +404,7 @@ def _select_nearest(candidates: pd.DataFrame) -> pd.Series:
 
     if strike_col is not None and underlying_col is not None:
         distance = (candidates[strike_col] - candidates[underlying_col]).abs()
-        return _select_one(candidates, distance.idxmin())
+        return _select_by_extremum(candidates, distance)
 
     return candidates.iloc[0]
 
@@ -387,15 +420,15 @@ def _select_highest_premium(candidates: pd.DataFrame) -> pd.Series:
     cost_col = _find_cost_col(candidates)
     if cost_col == "entry":
         # Unsigned prices: highest premium = max value
-        return _select_one(candidates, candidates[cost_col].idxmax())
+        return _select_by_extremum(candidates, candidates[cost_col], pick_max=True)
     # Signed costs: highest credit = most negative = min value
-    return _select_one(candidates, candidates[cost_col].idxmin())
+    return _select_by_extremum(candidates, candidates[cost_col], pick_max=False)
 
 
 def _select_lowest_premium(candidates: pd.DataFrame) -> pd.Series:
     """Select the trade with the lowest debit (cheapest absolute entry cost)."""
     cost_col = _find_cost_col(candidates)
-    return _select_one(candidates, candidates[cost_col].abs().idxmin())
+    return _select_by_extremum(candidates, candidates[cost_col].abs(), pick_max=False)
 
 
 def _select_first(candidates: pd.DataFrame) -> pd.Series:
@@ -519,15 +552,21 @@ def _compute_summary(trade_log: pd.DataFrame, capital: float) -> dict[str, Any]:
     wins = pnl[pnl > 0]
     losses = pnl[pnl < 0]
 
-    # Max drawdown from equity curve
+    # Max drawdown from equity curve (prepend starting capital so losses on
+    # the very first trade are captured relative to initial equity).
     equity = trade_log["equity"]
-    max_dd = _max_drawdown(equity)
+    equity_with_start = (
+        np.concatenate(([capital], equity.to_numpy(dtype=float)))
+        if capital > 0
+        else equity.to_numpy(dtype=float)
+    )
+    max_dd = _max_drawdown(equity_with_start)
 
     # Derive true daily returns from the equity curve for annualised
-    # metrics (Sharpe, Sortino, Calmar).  The equity curve is indexed by
-    # trade exit dates which are NOT evenly spaced.  Resampling to daily
-    # frequency with forward-fill ensures pct_change() produces genuine
-    # daily returns suitable for the 252-day annualisation factor.
+    # metrics (Sharpe, Sortino, Calmar, Omega).  The equity curve is indexed
+    # by trade exit dates which are NOT evenly spaced.  Resampling to calendar
+    # daily frequency ("D") with forward-fill preserves weekend exit dates and
+    # produces 365-day series, so we annualise with annual_days=365.
     _has_dates = "exit_date" in trade_log.columns and "entry_date" in trade_log.columns
     if _has_dates:
         # When multiple trades exit on the same date, use groupby to get
@@ -535,18 +574,24 @@ def _compute_summary(trade_log: pd.DataFrame, capital: float) -> dict[str, Any]:
         # a unique datetime index required by resample("D").
         equity_daily = trade_log.groupby("exit_date")["equity"].last()
         equity_daily.index = pd.to_datetime(equity_daily.index)
-        # Prepend initial capital at the first entry date so the full
-        # period is represented (including flat days before first exit).
-        first_entry = pd.to_datetime(trade_log["entry_date"].iloc[0])
-        if first_entry not in equity_daily.index:
-            equity_daily.loc[first_entry] = capital
-            equity_daily = equity_daily.sort_index()
-        equity_daily = equity_daily.resample("D").ffill()
+        # Prepend initial capital at (or one day before, for same-day closes)
+        # the earliest entry date so the full period and trade 1's return are
+        # represented.
+        first_entry = pd.to_datetime(trade_log["entry_date"].min())
+        seed_date = (
+            first_entry - pd.Timedelta(days=1)
+            if first_entry in equity_daily.index
+            else first_entry
+        )
+        equity_daily.loc[seed_date] = capital
+        equity_daily = equity_daily.sort_index().resample("D").ffill()
         daily_returns = equity_daily.pct_change().dropna()
+        annual_days = 365
     else:
         # Fallback for minimal trade logs (e.g. unit tests) without date
         # columns — use inter-trade equity changes.
         daily_returns = equity.pct_change().dropna()
+        annual_days = 252
 
     # Per-trade returns are still correct for VaR/CVaR (no annualisation).
     per_trade_returns = trade_log["pct_change"]
@@ -561,17 +606,17 @@ def _compute_summary(trade_log: pd.DataFrame, capital: float) -> dict[str, Any]:
         "avg_pnl": float(pnl.mean()),
         "avg_win": float(wins.mean()) if len(wins) > 0 else 0.0,
         "avg_loss": float(losses.mean()) if len(losses) > 0 else 0.0,
-        "max_win": float(pnl.max()),
-        "max_loss": float(pnl.min()),
+        "max_win": float(wins.max()) if len(wins) > 0 else 0.0,
+        "max_loss": float(losses.min()) if len(losses) > 0 else 0.0,
         "profit_factor": _profit_factor(pnl),
         "max_drawdown": max_dd,
         "avg_days_in_trade": float(trade_log["days_held"].mean()),
-        "sharpe_ratio": sharpe_ratio(daily_returns),
-        "sortino_ratio": sortino_ratio(daily_returns),
+        "sharpe_ratio": sharpe_ratio(daily_returns, trading_days=annual_days),
+        "sortino_ratio": sortino_ratio(daily_returns, trading_days=annual_days),
         "var_95": value_at_risk(per_trade_returns, 0.95),
         "cvar_95": conditional_value_at_risk(per_trade_returns, 0.95),
-        "calmar_ratio": calmar_ratio(daily_returns),
-        "omega_ratio": omega_ratio(daily_returns),
+        "calmar_ratio": calmar_ratio(daily_returns, trading_days=annual_days),
+        "omega_ratio": omega_ratio(daily_returns, trading_days=annual_days),
         "tail_ratio": tail_ratio(daily_returns),
     }
 
@@ -587,8 +632,8 @@ def _filter_trades(
     - ``max_positions=1``: keep trade only if its entry_date >= the previous
       kept trade's exit_date (greedy non-overlap).
     - ``max_positions > 1``: track open intervals.  Keep trade if fewer than
-      *max_positions* are open **and** no open position shares the same
-      expiration.
+      *max_positions* are open **and** no open position for the same symbol
+      shares the same expiration.
 
     Returns the filtered DataFrame of trades that will execute.
     """
@@ -599,6 +644,11 @@ def _filter_trades(
     entry_dates = trades["entry_date"].values
     exit_dates = trades["exit_date"].values
     expirations = trades["expiration"].values
+    symbols = (
+        trades["underlying_symbol"].values
+        if "underlying_symbol" in trades.columns
+        else None
+    )
 
     keep = np.zeros(n, dtype=bool)
 
@@ -610,29 +660,23 @@ def _filter_trades(
                 keep[i] = True
                 prev_exit = exit_dates[i]
     else:
-        # Track open positions using pre-allocated numpy arrays to avoid
-        # repeated Python list creation.  In-place compaction keeps only
-        # positions whose exit_date is still in the future.
-        _open_exits = np.empty(max_positions, dtype=exit_dates.dtype)
-        _open_exps = np.empty(max_positions, dtype=expirations.dtype)
-        n_open = 0
+        # Track open positions; in-place compaction keeps only positions whose
+        # exit_date is still in the future. Key duplicate-expiration checks by
+        # (symbol, expiration) so distinct symbols can share an expiration date.
+        open_positions: list[tuple[Any, Any]] = []
         for i in range(n):
-            # Compact: remove expired positions in-place
-            write = 0
-            for j in range(n_open):
-                if _open_exits[j] > entry_dates[i]:
-                    _open_exits[write] = _open_exits[j]
-                    _open_exps[write] = _open_exps[j]
-                    write += 1
-            n_open = write
+            entry_dt = entry_dates[i]
+            open_positions = [p for p in open_positions if p[0] > entry_dt]
 
-            if n_open < max_positions:
-                # Check no duplicate expiration
-                if expirations[i] not in _open_exps[:n_open]:
+            if len(open_positions) < max_positions:
+                exp_key = (
+                    (symbols[i], expirations[i])
+                    if symbols is not None
+                    else expirations[i]
+                )
+                if all(p[1] != exp_key for p in open_positions):
                     keep[i] = True
-                    _open_exits[n_open] = exit_dates[i]
-                    _open_exps[n_open] = expirations[i]
-                    n_open += 1
+                    open_positions.append((exit_dates[i], exp_key))
 
     return trades.loc[keep].reset_index(drop=True)
 
@@ -645,11 +689,22 @@ def _build_trade_log(
 ) -> pd.DataFrame:
     """Compute P&L columns vectorially on filtered trades.
 
+    Trades are ordered chronologically by ``exit_date`` (when P&L is realized),
+    with ``entry_date`` as a deterministic tie-breaker, so ``cumulative_pnl``,
+    ``equity``, and ruin truncation reflect true realization order even when
+    concurrent positions close out of entry order.
+
     Returns a DataFrame with :data:`_TRADE_LOG_COLUMNS`.  If equity drops to
     zero or below (ruin), the log is truncated at that trade.
     """
     if trades.empty:
         return pd.DataFrame(columns=_TRADE_LOG_COLUMNS)
+
+    # Sort by exit_date (when P&L is realized) before computing cumulative equity
+    # and ruin truncation (matches _combine_trade_logs).
+    trades = trades.sort_values(
+        ["exit_date", "entry_date"], kind="mergesort"
+    ).reset_index(drop=True)
 
     commission = (
         trades["commission"].fillna(0.0).to_numpy(dtype=float)
@@ -702,6 +757,14 @@ def _build_trade_log(
         trade_log = trade_log.loc[:ruin_idx]
 
     return trade_log
+
+
+def _unwrap_strategy_name(strategy: Callable[..., Any]) -> str:
+    """Resolve the underlying strategy function name, unwrapping functools.partial."""
+    fn: Any = strategy
+    while isinstance(fn, partial):
+        fn = fn.func
+    return getattr(fn, "__name__", "")
 
 
 def simulate(
@@ -789,11 +852,10 @@ def simulate(
             summary=_compute_summary(empty_log, capital),
         )
 
-    raw = _adjust_candidate_returns(raw, quantity * multiplier)
+    raw = _adjust_candidate_returns(raw.copy(), quantity * multiplier)
 
     # Select one trade per entry date (on raw data so OTM% columns are
     # available to selectors)
-    raw = raw.copy()
     raw["_entry_date"] = _resolve_entry_date(raw)
     group_col = "_entry_date"
 
@@ -809,11 +871,13 @@ def simulate(
     )
 
     # Detect short single-leg strategies so normalisation can negate prices
-    strategy_name = getattr(strategy, "__name__", "")
+    strategy_name = _unwrap_strategy_name(strategy)
     is_short_single = strategy_name in _SHORT_SINGLE_LEG
 
-    # Normalise to uniform schema
-    exit_dte = int(strategy_kwargs.get("exit_dte", 0))
+    # Normalise to uniform schema; calendar/diagonal strategies default to
+    # exit_dte=7 in CalendarStrategyParams (vs 0 for standard strategies).
+    default_exit_dte = 7 if _is_calendar(selected_raw.columns) else 0
+    exit_dte = int(strategy_kwargs.get("exit_dte", default_exit_dte))
     trades = _normalise_trades(
         selected_raw, is_short_single=is_short_single, exit_dte=exit_dte
     )

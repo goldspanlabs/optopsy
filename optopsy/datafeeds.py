@@ -78,10 +78,11 @@ def _standardize_cols(
 
 
 def _infer_date_cols(data: pd.DataFrame) -> pd.DataFrame:
-    """Convert date columns to datetime format."""
-    data["expiration"] = pd.to_datetime(data.expiration)
-    data["quote_date"] = pd.to_datetime(data.quote_date)
-    return data
+    """Convert date columns to datetime format without mutating the caller's DataFrame."""
+    return data.assign(
+        expiration=pd.to_datetime(data["expiration"]),
+        quote_date=pd.to_datetime(data["quote_date"]),
+    )
 
 
 def csv_data(
@@ -315,6 +316,7 @@ def load_cached_options(
         "ask",
     ]
     optional = [
+        "underlying_price",
         "delta",
         "gamma",
         "theta",
@@ -373,6 +375,8 @@ def load_cached_stocks(
             "Install it with: pip install optopsy[data]"
         ) from exc
 
+    from .timestamps import normalize_dates
+
     store = get_store()
     df = store.read("yf_stocks", symbol)
     if df is None or df.empty:
@@ -387,9 +391,9 @@ def load_cached_stocks(
     if "quote_date" not in df.columns and "date" in df.columns:
         df = df.rename(columns={"date": "quote_date"})
 
-    # Ensure quote_date is datetime
+    # Ensure quote_date is tz-naive date-only datetime so start/end comparisons work
     if "quote_date" in df.columns:
-        df["quote_date"] = pd.to_datetime(df["quote_date"])
+        df["quote_date"] = normalize_dates(pd.to_datetime(df["quote_date"]))
 
     # Apply date filtering on quote_date
     if start_date is not None:

@@ -106,30 +106,50 @@ def _run_calendar_checks(params: Dict[str, Any], data: pd.DataFrame) -> Dict[str
     return _validate_and_check(CalendarStrategyParams, params, data)
 
 
+def _dtype_matches(series: pd.Series, expected: Tuple[str, ...]) -> bool:
+    """Return True if *series* matches the semantic dtype family of *expected*."""
+    dtype_str = str(series.dtype)
+    if dtype_str in expected:
+        return True
+    if any(t.startswith("datetime64") for t in expected):
+        return bool(pd.api.types.is_datetime64_any_dtype(series))
+    if any(t in ("int64", "float64") for t in expected):
+        return bool(
+            (
+                pd.api.types.is_integer_dtype(series)
+                or pd.api.types.is_float_dtype(series)
+            )
+            and not pd.api.types.is_bool_dtype(series)
+        )
+    if any(t in ("object", "str") for t in expected):
+        return bool(
+            pd.api.types.is_string_dtype(series) or pd.api.types.is_object_dtype(series)
+        )
+    return False
+
+
 def _check_data_types(data: pd.DataFrame) -> None:
     """Validate that DataFrame has required columns with correct data types."""
-    df_type_dict = data.dtypes.astype(str).to_dict()
     for k, et in expected_types.items():
-        if k not in df_type_dict:
+        if k not in data.columns:
             raise ValueError(f"Expected column: {k} not found in DataFrame")
-        if all(df_type_dict[k] != t for t in et):
+        if not _dtype_matches(data[k], et):
             raise ValueError(
-                f"{df_type_dict[k]} of {k} does not match expected types: {expected_types[k]}"
+                f"{data[k].dtype} of {k} does not match expected types: {expected_types[k]}"
             )
 
 
 def _check_greek_column(data: pd.DataFrame, greek: str) -> None:
     """Validate that an optional Greek column exists and has correct data type."""
-    df_type_dict = data.dtypes.astype(str).to_dict()
-    if greek not in df_type_dict:
+    if greek not in data.columns:
         raise ValueError(
             f"Greek column '{greek}' not found in DataFrame. "
             f"Required for delta filtering/grouping."
         )
     expected = optional_greek_types.get(greek, ("int64", "float64"))
-    if all(df_type_dict[greek] != t for t in expected):
+    if not _dtype_matches(data[greek], expected):
         raise ValueError(
-            f"{df_type_dict[greek]} of {greek} does not match expected types: {expected}"
+            f"{data[greek].dtype} of {greek} does not match expected types: {expected}"
         )
 
 
@@ -140,14 +160,13 @@ def _requires_volume(params: Dict[str, Any]) -> bool:
 
 def _check_volume_column(data: pd.DataFrame) -> None:
     """Validate that volume column exists and has correct data type."""
-    df_type_dict = data.dtypes.astype(str).to_dict()
-    if "volume" not in df_type_dict:
+    if "volume" not in data.columns:
         raise ValueError(
             "Column 'volume' not found in DataFrame. "
             "Required for liquidity-based slippage."
         )
     expected = optional_liquidity_types.get("volume", ("int64", "float64"))
-    if all(df_type_dict["volume"] != t for t in expected):
+    if not _dtype_matches(data["volume"], expected):
         raise ValueError(
-            f"{df_type_dict['volume']} of volume does not match expected types: {expected}"
+            f"{data['volume'].dtype} of volume does not match expected types: {expected}"
         )

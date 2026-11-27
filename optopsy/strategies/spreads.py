@@ -221,6 +221,7 @@ def protective_put(
             (Side.long, _puts),
         ],
         stock_data=stock_data,
+        apply_strike_rule=False,
         **kwargs,
     )
 
@@ -312,8 +313,8 @@ def put_back_spread(
     Generate put back spread (put ratio backspread) statistics.
 
     A put back spread consists of:
-    - Short 1 ITM put at higher strike
-    - Long 2 OTM puts at lower strike
+    - Long 2 OTM puts at lower strike (leg1)
+    - Short 1 ITM/ATM put at higher strike (leg2)
 
     This is a bearish strategy that profits from a large downward move.
     The 2:1 ratio provides large downside profit with limited upside risk.
@@ -325,7 +326,7 @@ def put_back_spread(
     Returns:
         DataFrame with put back spread strategy performance statistics
     """
-    return _spread(data, [(Side.short, _puts, 1), (Side.long, _puts, 2)], **kwargs)
+    return _spread(data, [(Side.long, _puts, 2), (Side.short, _puts, 1)], **kwargs)
 
 
 def call_front_spread(
@@ -358,8 +359,8 @@ def put_front_spread(
     Generate put front spread (put ratio spread) statistics.
 
     A put front spread consists of:
-    - Long 1 ITM put at higher strike
-    - Short 2 OTM puts at lower strike
+    - Short 2 OTM puts at lower strike (leg1)
+    - Long 1 ITM/ATM put at higher strike (leg2)
 
     This is a neutral-to-slightly-bearish strategy that profits from
     time decay when the underlying stays near the short strike.
@@ -371,4 +372,4 @@ def put_front_spread(
     Returns:
         DataFrame with put front spread strategy performance statistics
     """
-    return _spread(data, [(Side.long, _puts, 1), (Side.short, _puts, 2)], **kwargs)
+    return _spread(data, [(Side.short, _puts, 2), (Side.long, _puts, 1)], **kwargs)

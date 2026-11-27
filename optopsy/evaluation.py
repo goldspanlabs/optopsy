@@ -17,6 +17,7 @@ from .filters import (
     _cut_options_by_delta,
     _cut_options_by_dte,
     _get,
+    _ltrim,
     _remove_invalid_evaluated_options,
     _remove_min_bid_ask,
     _select_closest_delta,
@@ -25,26 +26,30 @@ from .filters import (
 
 
 def _get_exits(
-    data: pd.DataFrame, exit_dte: int, exit_dte_tolerance: int = 0
+    data: pd.DataFrame,
+    exit_dte: int,
+    exit_dte_tolerance: int = 0,
+    *,
+    select_closest: bool = True,
 ) -> pd.DataFrame:
     """
     Get exit rows from option data, optionally using tolerance-based DTE matching.
 
     When tolerance is 0 (default), only rows with exactly the target exit_dte are
     returned. When tolerance > 0, rows within [max(0, exit_dte - tolerance),
-    exit_dte + tolerance] are considered, and for each contract the row with DTE
-    closest to exit_dte is selected.
-
-    Args:
-        data: DataFrame containing option data with 'dte' column
-        exit_dte: Target DTE for exit
-        exit_dte_tolerance: Maximum allowed deviation from exit_dte (default 0)
-
-    Returns:
-        DataFrame of exit rows
+    exit_dte + tolerance] are considered. If *select_closest* is True (default),
+    for each contract the row with DTE closest to exit_dte is selected; when False,
+    all eligible exit rows (deduplicated per contract and quote_date) are returned
+    so multi-leg strategies can match on a common exit date before selecting the
+    closest exit.
     """
+    contract_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
+
     if exit_dte_tolerance == 0:
-        return _get(data, "dte", exit_dte)
+        exits = _get(data, "dte", exit_dte)
+        if exits.empty:
+            return exits
+        return exits.drop_duplicates(subset=contract_cols, keep="first")
 
     lower = max(0, exit_dte - exit_dte_tolerance)
     upper = exit_dte + exit_dte_tolerance
@@ -53,10 +58,19 @@ def _get_exits(
     if candidates.empty:
         return candidates
 
-    # For each contract, pick the row with DTE closest to exit_dte
-    contract_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
+    if not select_closest:
+        dedup_cols = contract_cols + (
+            ["quote_date"] if "quote_date" in candidates.columns else []
+        )
+        return candidates.drop_duplicates(subset=dedup_cols, keep="first")
+
+    # For each contract, pick the row with DTE closest to exit_dte.
+    # Sort deterministically by (dte, quote_date) so equidistant ties always
+    # break the same way regardless of input row order.
     candidates = candidates.copy()
     candidates["_dte_diff"] = (candidates["dte"] - exit_dte).abs()
+    sort_cols = ["dte"] + (["quote_date"] if "quote_date" in candidates.columns else [])
+    candidates = candidates.sort_values(sort_cols, kind="mergesort")
     idx = candidates.groupby(contract_cols, observed=True)["_dte_diff"].idxmin()
     exits = candidates.loc[idx].drop(columns=["_dte_diff"])
     return exits
@@ -72,18 +86,32 @@ def _match_entries_exits(
     if entry_dates is not None:
         entries = _apply_signal_filter(entries, entry_dates)
 
-    exits = _get_exits(data, kwargs["exit_dte"], kwargs.get("exit_dte_tolerance", 0))
-
+    # Filter exit candidates by exit_dates BEFORE tolerance selection so that
+    # a valid signal date within exit_dte_tolerance is not shadowed by a closer
+    # non-signal date.
+    exit_candidates = data
     if exit_dates is not None:
-        exits = _apply_signal_filter(exits, exit_dates)
+        exit_candidates = _apply_signal_filter(exit_candidates, exit_dates)
+
+    exits = _get_exits(
+        exit_candidates,
+        kwargs["exit_dte"],
+        kwargs.get("exit_dte_tolerance", 0),
+        select_closest=kwargs.get("select_closest_exit", True),
+    )
 
     merge_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
 
     result = (
         entries.merge(right=exits, on=merge_cols, suffixes=("_entry", "_exit"))
         .assign(
-            entry=lambda r: (r["bid_entry"] + r["ask_entry"]) / 2,
-            exit=lambda r: (r["bid_exit"] + r["ask_exit"]) / 2,
+            entry=lambda r: (
+                (r["bid_entry"].astype("float64") + r["ask_entry"].astype("float64"))
+                / 2
+            ),
+            exit=lambda r: (
+                (r["bid_exit"].astype("float64") + r["ask_exit"].astype("float64")) / 2
+            ),
         )
         .pipe(_remove_invalid_evaluated_options)
     )
@@ -109,7 +137,10 @@ def _evaluate_options(data: pd.DataFrame, **kwargs: Any) -> pd.DataFrame:
     Selects the closest-delta option per group within [min, max] range,
     then matches with exit rows.
     """
-    entries = _remove_min_bid_ask(data, kwargs["min_bid_ask"])
+    # Entries must still be at or above exit_dte even when data retains lower
+    # DTE rows for exit_dte_tolerance matching.
+    entries = _ltrim(data, "dte", kwargs["exit_dte"])
+    entries = _remove_min_bid_ask(entries, kwargs["min_bid_ask"])
     entries = _select_closest_delta(
         entries,
         kwargs["delta_target"],
@@ -126,9 +157,12 @@ def _evaluate_all_options(data: pd.DataFrame, **kwargs: Any) -> pd.DataFrame:
     Filters by DTE, selects entries via delta targeting, then groups by
     DTE intervals and delta intervals.
     """
+    exit_dte = kwargs["exit_dte"]
+    exit_dte_tolerance = kwargs.get("exit_dte_tolerance", 0)
+    lower_dte = max(0, exit_dte - exit_dte_tolerance)
     return (
         data.pipe(_assign_dte)
-        .pipe(_trim, "dte", kwargs["exit_dte"], kwargs["max_entry_dte"])
+        .pipe(_trim, "dte", lower_dte, kwargs["max_entry_dte"])
         .pipe(_evaluate_options, **kwargs)
         .pipe(_cut_options_by_dte, kwargs["dte_interval"], kwargs["max_entry_dte"])
         .pipe(_cut_options_by_delta, kwargs.get("delta_interval", 0.05))

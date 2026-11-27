@@ -246,7 +246,7 @@ def omega_ratio(
         return 0.0
     result = empyrical.omega_ratio(
         returns,
-        risk_free=risk_free_rate,
+        risk_free=risk_free_rate / trading_days,
         required_return=0.0,
         annualization=trading_days,
     )
@@ -317,6 +317,8 @@ def compute_risk_metrics(
 
 
 def _to_array(data: _ArrayLike) -> np.ndarray:
-    """Convert input to a flat numpy array, dropping NaNs."""
-    arr = np.asarray(data)
+    """Convert input to a flat float numpy array, dropping NaNs."""
+    if isinstance(data, pd.Series):
+        data = data.dropna()
+    arr = np.asarray(data, dtype=float)
     return arr[~np.isnan(arr)]
