@@ -7,6 +7,12 @@
 # trigger in python-publish.yml would not fire from here. workflow_dispatch is
 # the one event GITHUB_TOKEN may trigger, and it keeps python-publish's
 # trusted-publishing identity unchanged.
+#
+# Retrying a failed run: re-run it with the same exact `version` input. Each
+# stage is skipped when its work already exists (bump commit on the branch,
+# tag/release on GitHub), so a retry picks up where the failure happened.
+# Do not retry with `bump` on a run that already pushed the bump commit: the
+# bump would be applied a second time.
 
 name: Release
 
@@ -14,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Exact version to release (e.g. 2.3.1, 2.4.0b1). Leave empty to bump from the current version."
+        description: "Exact version to release (e.g. 2.3.1, 2.4.0b1). Leave empty to bump from the current version. Pass this explicitly when retrying a failed run."
         required: false
         type: string
       bump:
@@ -49,7 +55,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Compute and apply version
+      - name: Compute version
         id: version
         env:
           INPUT_VERSION: ${{ inputs.version }}
@@ -58,8 +64,7 @@ jobs:
           python3 - <<'EOF'
           import os, re, tomllib, pathlib
 
-          pyproject = pathlib.Path("pyproject.toml")
-          text = pyproject.read_text()
+          text = pathlib.Path("pyproject.toml").read_text()
           current = tomllib.loads(text)["project"]["version"]
 
           requested = os.environ["INPUT_VERSION"].strip().lstrip("v")
@@ -81,46 +86,70 @@ jobs:
 
           if not re.fullmatch(r"\d+\.\d+\.\d+((a|b|rc)\d+)?", new):
               raise SystemExit(f"Invalid version {new!r}")
-          if new == current:
-              raise SystemExit(f"Version {new} is already the current version")
 
-          updated, n = re.subn(
-              r'^version = "[^"]+"',
-              f'version = "{new}"',
-              text,
-              count=1,
-              flags=re.MULTILINE,
-          )
-          if n != 1:
-              raise SystemExit("Could not find version line in pyproject.toml")
-          pyproject.write_text(updated)
-
-          print(f"{current} -> {new}")
+          needs_bump = new != current
+          print(f"{current} -> {new} (bump needed: {needs_bump})")
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write(f"version={new}\n")
               out.write(f"tag=v{new}\n")
+              out.write(f"current={current}\n")
+              out.write(f"needs_bump={str(needs_bump).lower()}\n")
           EOF
 
-      - name: Fail if tag already exists
+      - name: Check for existing tag and release
+        id: state
         env:
+          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}
         run: |
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
-            echo "::error::Tag $TAG already exists"
+          # Check each lookup's exit status: a network or auth failure must
+          # stop the run, not look like "not found".
+          if ! remote_tags=$(git ls-remote --tags origin); then
+            echo "::error::git ls-remote failed"
+            exit 1
+          fi
+          if ! releases=$(gh release list --limit 1000 --json tagName --jq '.[].tagName'); then
+            echo "::error::gh release list failed"
             exit 1
           fi
 
+          tag_exists=false
+          release_exists=false
+          # Match the exact ref name (not a prefix such as v2.3.1 vs v2.3.10).
+          if awk -v t="refs/tags/$TAG" '$2 == t || $2 == t "^{}" { found = 1 } END { exit !found }' <<< "$remote_tags"; then
+            tag_exists=true
+          fi
+          if grep -Fxq "$TAG" <<< "$releases"; then release_exists=true; fi
+
+          if [ "$tag_exists" = "true" ] && [ "$release_exists" = "false" ]; then
+            echo "::error::Tag $TAG exists without a GitHub release. Resolve manually before retrying."
+            exit 1
+          fi
+
+          echo "tag_exists=$tag_exists" >> "$GITHUB_OUTPUT"
+          echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
+
       - name: Commit and push version bump
+        if: steps.state.outputs.release_exists == 'false' && steps.version.outputs.needs_bump == 'true'
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          pyproject_version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          if [ "$pyproject_version" != "$VERSION" ]; then
+            sed -i -E "0,/^version = \"[^\"]+\"/s//version = \"$VERSION\"/" pyproject.toml
+          fi
           git add pyproject.toml
-          git commit -m "Release v$VERSION"
+          if git diff --cached --quiet; then
+            echo "Version already set in pyproject.toml; nothing to commit"
+          else
+            git commit -m "Release v$VERSION"
+          fi
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
       - name: Create GitHub release
+        if: steps.state.outputs.release_exists == 'false'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.version.outputs.tag }}

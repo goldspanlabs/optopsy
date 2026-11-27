@@ -210,4 +210,8 @@ Publishing to PyPI is automated via GitHub Actions (`.github/workflows/python-pu
 Notes:
 - Releases created by the workflow's `GITHUB_TOKEN` do not trigger `release: published`, which is why publish is dispatched explicitly. A release created by hand still triggers publish automatically.
 - No API tokens are needed; PyPI uses trusted publishing.
-- Manual fallback: bump `pyproject.toml`, commit, then `gh release create v<version> --generate-notes` (add `--prerelease` for betas).
+- Manual fallback: bump `pyproject.toml`, commit and push, then create the release against that commit (add `--prerelease` for betas). Pass `--target` explicitly, or the tag is created at the default branch's HEAD instead:
+  ```bash
+  git add pyproject.toml && git commit -m "Release v2.3.1" && git push origin HEAD
+  gh release create v2.3.1 --target "$(git rev-parse HEAD)" --generate-notes
+  ```
