@@ -118,13 +118,16 @@ def _is_calendar(columns: pd.Index) -> bool:
     return _CALENDAR_MARKER in columns
 
 
-def _scale_commission_for_quantity(commission: Any, quantity: int) -> Any:
-    """Scale per-contract and per-share fees for simulator quantity.
+def _scale_commission_for_quantity(
+    commission: Any, quantity: int, multiplier: int
+) -> Any:
+    """Scale variable fees to the simulated lot size.
 
     Base and minimum fees apply once per side of the simulated trade, so they
-    must not be multiplied by the number of contracts.
+    must not be multiplied by the number of contracts. Per-share fees scale
+    with the simulated share count (quantity * multiplier).
     """
-    if commission is None or quantity == 1:
+    if commission is None:
         return commission
 
     if isinstance(commission, (int, float)) and not isinstance(commission, bool):
@@ -137,10 +140,39 @@ def _scale_commission_for_quantity(commission: Any, quantity: int) -> Any:
     else:
         return commission
 
-    for fee in ("per_contract", "per_share"):
-        if fee in config:
-            config[fee] *= quantity
+    if "per_contract" in config:
+        config["per_contract"] *= quantity
+    if "per_share" in config:
+        config["per_share"] *= quantity * multiplier / 100
     return config
+
+
+def _adjust_candidate_returns(raw: pd.DataFrame, lot_size: int) -> pd.DataFrame:
+    """Recompute candidate returns after applying lot-sized commission.
+
+    Strategy functions express prices per standard 100-share contract and
+    deduct commission in those same units. Recover gross per-contract P&L,
+    then apply the simulated lot size and dollar commission before selectors
+    inspect ``pct_change``.
+    """
+    if "total_commission" not in raw.columns or "pct_change" not in raw.columns:
+        return raw
+
+    entry_col = "total_entry_cost" if "total_entry_cost" in raw.columns else "entry"
+    if entry_col not in raw.columns:
+        return raw
+
+    basis = pd.to_numeric(raw[entry_col], errors="coerce").abs()
+    fee = pd.to_numeric(raw["total_commission"], errors="coerce").fillna(0.0)
+    pct_change = pd.to_numeric(raw["pct_change"], errors="coerce")
+    gross_pnl_per_contract = pct_change * basis + fee / 100
+    denominator = basis * lot_size
+    raw["pct_change"] = np.where(
+        denominator > 0,
+        (gross_pnl_per_contract * lot_size - fee) / denominator,
+        np.nan,
+    )
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -735,7 +767,7 @@ def simulate(
     strategy_kwargs = strategy_kwargs.copy()
     if "commission" in strategy_kwargs:
         strategy_kwargs["commission"] = _scale_commission_for_quantity(
-            strategy_kwargs["commission"], quantity
+            strategy_kwargs["commission"], quantity, multiplier
         )
 
     # Generate raw trades — return empty result for empty input
@@ -752,6 +784,8 @@ def simulate(
             equity_curve=empty_curve,
             summary=_compute_summary(empty_log, capital),
         )
+
+    raw = _adjust_candidate_returns(raw, quantity * multiplier)
 
     # Select one trade per entry date (on raw data so OTM% columns are
     # available to selectors)

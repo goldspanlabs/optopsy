@@ -533,6 +533,50 @@ class TestSimulateSmoke:
         assert trade["equity"] == pytest.approx(100_000 + gross_pnl - expected_fee)
         assert result.summary["total_pnl"] == pytest.approx(gross_pnl - expected_fee)
 
+    def test_custom_selector_receives_lot_adjusted_candidate_returns(self, data):
+        seen = {}
+
+        def select_best_net_return(candidates):
+            seen["candidates"] = candidates.copy()
+            return candidates.loc[candidates["pct_change"].idxmax()]
+
+        simulate(
+            data,
+            op.long_calls,
+            selector=select_best_net_return,
+            quantity=3,
+            multiplier=100,
+            slippage="mid",
+            commission=Commission(per_contract=0.65, base_fee=9.99),
+        )
+
+        candidates = seen["candidates"]
+        lot_size = 300
+        expected = (
+            (candidates["exit"] - candidates["entry"]) * lot_size
+            - candidates["total_commission"]
+        ) / (candidates["entry"].abs() * lot_size)
+        assert candidates["pct_change"].to_numpy() == pytest.approx(expected.to_numpy())
+
+    def test_stock_commission_scales_to_nonstandard_multiplier(
+        self, multi_strike_data, stock_data_multi_strike
+    ):
+        result = simulate(
+            multi_strike_data,
+            op.covered_call,
+            selector="first",
+            multiplier=10,
+            stock_data=stock_data_multi_strike,
+            slippage="mid",
+            commission=Commission(per_share=0.005),
+        )
+
+        trade = result.trade_log.iloc[0]
+        assert trade["commission"] == pytest.approx(0.10)
+        assert trade["realized_pnl"] == pytest.approx(
+            (trade["exit_proceeds"] - trade["entry_cost"]) * 10 - 0.10
+        )
+
     def test_missing_or_nan_commission_defaults_to_zero_and_fees_can_flip_win(self):
         trades = pd.DataFrame(
             {
