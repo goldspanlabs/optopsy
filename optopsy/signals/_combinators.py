@@ -10,6 +10,11 @@ from ._helpers import SignalFunc, _groupby_symbol
 # ---------------------------------------------------------------------------
 
 
+def _requires_per_strike(sig: SignalFunc | "Signal") -> bool:
+    """Return True if *sig* needs per-strike option rows rather than 1 row/date."""
+    return bool(getattr(sig, "requires_per_strike", False))
+
+
 def and_signals(*signals: SignalFunc) -> SignalFunc:
     """Combine multiple signals with logical AND.
 
@@ -20,8 +25,12 @@ def and_signals(*signals: SignalFunc) -> SignalFunc:
         result = pd.Series(True, index=data.index)
         for sig in signals:
             result = result & sig(data)
+            if not result.any():
+                return result
         return result
 
+    if any(_requires_per_strike(s) for s in signals):
+        combined.requires_per_strike = True  # type: ignore[attr-defined]
     return combined
 
 
@@ -35,8 +44,12 @@ def or_signals(*signals: SignalFunc) -> SignalFunc:
         result = pd.Series(False, index=data.index)
         for sig in signals:
             result = result | sig(data)
+            if result.all():
+                return result
         return result
 
+    if any(_requires_per_strike(s) for s in signals):
+        combined.requires_per_strike = True  # type: ignore[attr-defined]
     return combined
 
 
@@ -61,13 +74,56 @@ def sustained(signal_func: SignalFunc, days: int = 5) -> SignalFunc:
     if days < 1:
         raise ValueError(f"days must be >= 1, got {days}")
 
+    per_strike = _requires_per_strike(signal_func)
+
     def _signal(data: pd.DataFrame) -> "pd.Series[bool]":
+        if data.empty:
+            return pd.Series(False, index=data.index, dtype=bool)
+        if per_strike:
+            # Evaluate on full per-strike data, collapse to 1 bool per (symbol, date),
+            # compute rolling minimum across consecutive dates, then map back.
+            raw = signal_func(data).fillna(False).astype(bool)
+            daily = (
+                pd.DataFrame(
+                    {
+                        "underlying_symbol": data["underlying_symbol"].values,
+                        "quote_date": data["quote_date"].values,
+                        "_flag": raw.values,
+                    }
+                )
+                .groupby(["underlying_symbol", "quote_date"], sort=True)["_flag"]
+                .any()
+                .reset_index()
+            )
+            daily["_sustained"] = (
+                daily.groupby("underlying_symbol", sort=False)["_flag"]
+                .transform(lambda s: s.astype(int).rolling(days).min().fillna(0))
+                .astype(bool)
+            )
+            lookup = pd.Series(
+                daily["_sustained"].values,
+                index=pd.MultiIndex.from_arrays(
+                    [daily["underlying_symbol"], daily["quote_date"]]
+                ),
+            )
+            keys = pd.MultiIndex.from_arrays(
+                [data["underlying_symbol"], data["quote_date"]]
+            )
+            return pd.Series(
+                lookup.reindex(keys).fillna(False).values,
+                index=data.index,
+                dtype=bool,
+            )
+
+        raw = signal_func(data).fillna(False).astype(int)
+
         def _compute_group(group: pd.DataFrame) -> "pd.Series[bool]":
-            raw = signal_func(group)
-            return raw.astype(int).rolling(days).min().fillna(0).astype(bool)
+            return raw.loc[group.index].rolling(days).min().fillna(0).astype(bool)
 
         return _groupby_symbol(data, _compute_group)
 
+    if per_strike:
+        _signal.requires_per_strike = True  # type: ignore[attr-defined]
     return _signal
 
 
@@ -114,6 +170,8 @@ class Signal:
 
     def __init__(self, func: SignalFunc) -> None:
         self._func = func
+        if _requires_per_strike(func):
+            self.requires_per_strike = True
 
     def __call__(self, data: pd.DataFrame) -> "pd.Series[bool]":
         return self._func(data)
@@ -122,12 +180,16 @@ class Signal:
         def combined(data: pd.DataFrame) -> "pd.Series[bool]":
             return self(data) & other(data)
 
+        if _requires_per_strike(self) or _requires_per_strike(other):
+            combined.requires_per_strike = True  # type: ignore[attr-defined]
         return Signal(combined)
 
     def __or__(self, other: "Signal | SignalFunc") -> "Signal":
         def combined(data: pd.DataFrame) -> "pd.Series[bool]":
             return self(data) | other(data)
 
+        if _requires_per_strike(self) or _requires_per_strike(other):
+            combined.requires_per_strike = True  # type: ignore[attr-defined]
         return Signal(combined)
 
     def __repr__(self) -> str:
@@ -147,7 +209,8 @@ def signal_dates(
 
     This is the recommended way to generate ``entry_dates`` / ``exit_dates``
     for strategy functions.  Signals are computed entirely from stock price
-    data — no options data is involved.
+    data — no options data is involved (except for per-strike IV rank signals,
+    which preserve all option rows when ``requires_per_strike`` is set).
 
     Args:
         stock_data: OHLCV DataFrame with at least ``underlying_symbol``,
@@ -177,12 +240,10 @@ def signal_dates(
         )
     """
     df = stock_data.copy()
-    df["quote_date"] = normalize_dates(df["quote_date"])
-    df = (
-        df.drop_duplicates(["underlying_symbol", "quote_date"])
-        .sort_values(["underlying_symbol", "quote_date"])
-        .reset_index(drop=True)
-    )
+    df["quote_date"] = normalize_dates(pd.to_datetime(df["quote_date"]))
+    if not _requires_per_strike(signal_func):
+        df = df.drop_duplicates(["underlying_symbol", "quote_date"])
+    df = df.sort_values(["underlying_symbol", "quote_date"]).reset_index(drop=True)
     mask = signal_func(df)
     return (
         df.loc[mask, ["underlying_symbol", "quote_date"]]

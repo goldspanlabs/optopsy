@@ -13,8 +13,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .filters import _remove_min_bid_ask, _select_closest_delta, _trim
-from .pricing import _calculate_fill_price
+from .filters import (
+    _apply_signal_filter,
+    _remove_min_bid_ask,
+    _select_closest_delta,
+    _trim,
+)
+from .pricing import (
+    _calculate_commission,
+    _calculate_fill_price,
+    _compute_net_pct_change,
+    _get_leg_quantity,
+)
 
 
 def _evaluate_calendar_options(
@@ -73,6 +83,7 @@ def _prepare_calendar_leg(
         "bid": f"bid_leg{leg_num}",
         "ask": f"ask_leg{leg_num}",
         "delta": f"delta_leg{leg_num}",
+        "volume": f"volume_leg{leg_num}",
     }
     return options.rename(columns=rename_map)
 
@@ -115,6 +126,11 @@ def _merge_calendar_legs(
     front_cols = _get_calendar_leg_columns(1, same_strike)
     back_cols = _get_calendar_leg_columns(2, same_strike)
 
+    if "volume_leg1" in front.columns:
+        front_cols = front_cols + ["volume_leg1"]
+    if "volume_leg2" in back.columns:
+        back_cols = back_cols + ["volume_leg2"]
+
     return pd.merge(front[front_cols], back[back_cols], on=join_cols, how="inner")
 
 
@@ -140,6 +156,7 @@ def _get_exit_leg_subset(
             "expiration": f"expiration_leg{leg_num}",
             "bid": f"exit_bid_leg{leg_num}",
             "ask": f"exit_ask_leg{leg_num}",
+            "volume": f"exit_volume_leg{leg_num}",
         }
     )
 
@@ -155,8 +172,11 @@ def _get_exit_leg_subset(
     ]
 
     subset_cols = join_cols + [f"exit_bid_leg{leg_num}", f"exit_ask_leg{leg_num}"]
+    if f"exit_volume_leg{leg_num}" in renamed.columns:
+        subset_cols.append(f"exit_volume_leg{leg_num}")
 
-    return renamed[subset_cols], join_cols
+    subset = renamed[subset_cols].drop_duplicates(subset=join_cols, keep="first")
+    return subset, join_cols
 
 
 def _find_calendar_exit_prices(
@@ -165,6 +185,7 @@ def _find_calendar_exit_prices(
     exit_dte: int,
     same_strike: bool,
     exit_dte_tolerance: int = 0,
+    exit_dates: Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Find exit prices for calendar/diagonal spread positions.
@@ -175,27 +196,37 @@ def _find_calendar_exit_prices(
         exit_dte: Days before front expiration to exit
         same_strike: True for calendar spreads, False for diagonal
         exit_dte_tolerance: Maximum days of deviation from target exit date (default 0)
+        exit_dates: Optional signal DataFrame restricting eligible exit dates
 
     Returns:
         DataFrame with exit prices merged in, or empty DataFrame if no exit data
     """
+    # Filter candidate exit data by exit_dates BEFORE tolerance snapping so a
+    # valid signal date within tolerance is not shadowed by a closer non-signal date.
+    exit_pool = (
+        _apply_signal_filter(data, exit_dates) if exit_dates is not None else data
+    )
+    if exit_pool.empty:
+        return merged.iloc[:0]
+
     # Calculate exit date for each position.
     # Exit is timed relative to front leg (leg1) expiration, which is standard
     # calendar spread management: close before the short-dated option expires.
     # Both expiration and quote_date are already date-normalized at the root.
+    merged = merged.copy()
     merged["exit_date"] = merged["expiration_leg1"] - pd.Timedelta(days=exit_dte)
 
     all_exit_dates = merged["exit_date"].unique()
 
     if exit_dte_tolerance == 0:
         # Exact date matching (original behavior)
-        exit_data = data[data["quote_date"].isin(all_exit_dates)]
+        exit_data = exit_pool[exit_pool["quote_date"].isin(all_exit_dates)]
     else:
         # Tolerance-based matching: snap each target exit_date to the
         # closest available quote_date within tolerance using vectorized
         # searchsorted instead of a Python loop.
         tolerance_td = np.timedelta64(exit_dte_tolerance, "D")
-        available_dates = np.sort(data["quote_date"].unique())
+        available_dates = np.sort(exit_pool["quote_date"].unique())
 
         if len(available_dates) == 0:
             return merged.iloc[:0]
@@ -226,9 +257,11 @@ def _find_calendar_exit_prices(
         merged["exit_date"] = (
             merged["exit_date"].map(date_map).fillna(merged["exit_date"])
         )
-        exit_data = data[data["quote_date"].isin(date_map.values())]
+        exit_data = exit_pool[exit_pool["quote_date"].isin(date_map.values())]
 
-    if exit_data.empty:
+    # Never allow exit on or before entry date (prevents look-backward trades)
+    merged = merged[merged["exit_date"] > merged["quote_date"]]
+    if merged.empty or exit_data.empty:
         return merged.iloc[:0]
 
     # Merge exit prices for each leg
@@ -266,10 +299,12 @@ def _calculate_calendar_pnl(
     """
     front_side = leg_def[0][0].value
     back_side = leg_def[1][0].value
+    front_qty = _get_leg_quantity(leg_def[0])
+    back_qty = _get_leg_quantity(leg_def[1])
 
     # Calculate entry prices based on slippage model
-    volume_leg1 = merged.get("volume_leg1") if "volume_leg1" in merged.columns else None
-    volume_leg2 = merged.get("volume_leg2") if "volume_leg2" in merged.columns else None
+    volume_leg1 = merged["volume_leg1"] if "volume_leg1" in merged.columns else None
+    volume_leg2 = merged["volume_leg2"] if "volume_leg2" in merged.columns else None
 
     num_legs = len(leg_def)
     merged["entry_leg1"] = _calculate_fill_price(
@@ -296,16 +331,19 @@ def _calculate_calendar_pnl(
     )
 
     # Calculate exit prices (reverse sides for closing positions)
-    # Note: Exit volume is not currently tracked for calendar spreads since exit
-    # data comes from a different quote date. For liquidity mode, exits use
-    # the base fill_ratio without volume adjustment.
+    exit_vol_leg1 = (
+        merged["exit_volume_leg1"] if "exit_volume_leg1" in merged.columns else None
+    )
+    exit_vol_leg2 = (
+        merged["exit_volume_leg2"] if "exit_volume_leg2" in merged.columns else None
+    )
     merged["exit_leg1"] = _calculate_fill_price(
         merged["exit_bid_leg1"],
         merged["exit_ask_leg1"],
         -front_side,
         slippage,
         fill_ratio,
-        None,
+        exit_vol_leg1,
         reference_volume,
         per_leg_slippage,
         num_legs,
@@ -316,15 +354,15 @@ def _calculate_calendar_pnl(
         -back_side,
         slippage,
         fill_ratio,
-        None,
+        exit_vol_leg2,
         reference_volume,
         per_leg_slippage,
         num_legs,
     )
 
-    # Apply position multipliers based on leg definition
-    front_multiplier = front_side
-    back_multiplier = back_side
+    # Apply position multipliers (direction x quantity) based on leg definition
+    front_multiplier = front_side * front_qty
+    back_multiplier = back_side * back_qty
 
     merged["entry_leg1"] = merged["entry_leg1"] * front_multiplier
     merged["exit_leg1"] = merged["exit_leg1"] * front_multiplier
@@ -337,20 +375,19 @@ def _calculate_calendar_pnl(
 
     net_pnl = merged["total_exit_proceeds"] - merged["total_entry_cost"]
 
+    comm_dollars: pd.Series | float = 0.0
     if commission is not None:
-        from .pricing import _SHARES_PER_CONTRACT, _calculate_commission
-
         comm_per_side = _calculate_commission(leg_def, commission)
         merged["total_commission"] = comm_per_side * 2
-        net_pnl = net_pnl - merged["total_commission"] / _SHARES_PER_CONTRACT
+        comm_dollars = merged["total_commission"]
 
     # Calculate percentage change.
     # Use a minimum threshold to avoid misleading percentages from near-zero entries.
-    min_entry_threshold = 0.01
-    merged["pct_change"] = np.where(
-        merged["total_entry_cost"].abs() >= min_entry_threshold,
-        net_pnl / merged["total_entry_cost"].abs(),
-        np.nan,
+    merged["pct_change"] = _compute_net_pct_change(
+        net_pnl,
+        merged["total_entry_cost"],
+        comm_dollars,
+        min_entry_threshold=0.01,
     )
 
     return merged

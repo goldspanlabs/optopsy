@@ -107,25 +107,34 @@ def _cut_options_by_dte(
     data: pd.DataFrame, dte_interval: int, max_entry_dte: int
 ) -> pd.DataFrame:
     """Categorize options into DTE intervals for grouping."""
-    dte_intervals = list(range(0, max_entry_dte, dte_interval))
+    dte_intervals = list(range(0, max_entry_dte + dte_interval, dte_interval))
     data["dte_range"] = pd.cut(data["dte_entry"], dte_intervals)
     return data
 
 
-def _cut_options_by_delta(data: pd.DataFrame, delta_interval: float) -> pd.DataFrame:
+def _cut_options_by_delta(
+    data: pd.DataFrame,
+    delta_interval: float,
+    col: str = "delta_entry",
+    out_col: str = "delta_range",
+) -> pd.DataFrame:
     """
     Categorize options into delta intervals for grouping.
 
     Args:
-        data: DataFrame with delta_entry column
+        data: DataFrame with delta column
         delta_interval: Interval size for delta grouping
+        col: Source delta column name (default: delta_entry)
+        out_col: Output interval column name (default: delta_range)
 
     Returns:
-        DataFrame with delta_range column added
+        DataFrame with delta interval column added
     """
-    # Delta ranges from -1 to 1 for puts and calls
+    # Delta ranges from -1 to 1 for puts and calls.
+    # Round to 6 decimals so fine intervals (e.g. 0.005, 0.025) never collide
+    # into duplicate bin edges, and include_lowest=True so delta == -1.0 is kept.
     delta_intervals = np.round(
-        np.arange(-1.0, 1.0 + delta_interval, delta_interval), 2
+        np.arange(-1.0, 1.0 + delta_interval, delta_interval), 6
     ).tolist()
-    data["delta_range"] = pd.cut(data["delta_entry"], delta_intervals)
+    data[out_col] = pd.cut(data[col], delta_intervals, include_lowest=True)
     return data

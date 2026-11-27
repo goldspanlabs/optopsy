@@ -24,14 +24,29 @@ def _groupby_symbol(
 ) -> "pd.Series[bool]":
     """Apply *compute_group* per underlying_symbol and concatenate results.
 
-    Handles the empty-DataFrame and empty-groups (all-NA symbols) edge cases
-    that every per-symbol signal needs.
+    Handles the empty-DataFrame, empty-groups (all-NA symbols), and unsorted
+    ``quote_date`` edge cases that every per-symbol signal needs.
     """
     if data.empty:
         return pd.Series(False, index=data.index, dtype=bool)
+
+    def _run_sorted(group: pd.DataFrame) -> "pd.Series[bool]":
+        if (
+            "quote_date" in group.columns
+            and not group["quote_date"].is_monotonic_increasing
+        ):
+            group = group.sort_values("quote_date", kind="mergesort")
+        return compute_group(group)
+
+    # Single-symbol fast path avoids groupby/concat overhead
+    symbols = data["underlying_symbol"]
+    first = symbols.iloc[0]
+    if pd.notna(first) and (symbols == first).all():
+        res = _run_sorted(data)
+        return res.reindex(data.index, fill_value=False)
+
     parts = [
-        compute_group(group)
-        for _, group in data.groupby("underlying_symbol", sort=False)
+        _run_sorted(group) for _, group in data.groupby("underlying_symbol", sort=False)
     ]
     if not parts:
         return pd.Series(False, index=data.index, dtype=bool)
@@ -210,7 +225,9 @@ def _direction_signal(
 ) -> SignalFunc:
     """Build a direction-change signal (Supertrend flip, PSAR flip).
 
-    Fires on the bar where the direction indicator transitions.
+    Fires on the bar where the direction indicator genuinely flips from the
+    opposite direction (``-target`` -> ``target``), avoiding spurious signals
+    on initial/warmup bars where the prior bar is ``NaN`` or ``0``.
 
     Args:
         compute_fn: Takes a group DataFrame, returns a direction Series
@@ -226,8 +243,8 @@ def _direction_signal(
             direction = compute_fn(group)
             if direction is None:
                 return pd.Series(False, index=group.index)
-            # Fire when direction changes to target value
-            changed = (direction == target) & (direction.shift(1) != target)
+            # Require a true flip from the opposite direction
+            changed = (direction == target) & (direction.shift(1) == -target)
             return changed.fillna(False)
 
         return _groupby_symbol(data, _compute_group)

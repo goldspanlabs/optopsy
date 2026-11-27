@@ -166,7 +166,9 @@ def daily_return_above(pct: float = 1.0) -> SignalFunc:
             close = _get_close(group)
             if close is None:
                 return pd.Series(False, index=group.index)
-            ret = close.pct_change()
+            ret = close.pct_change(fill_method=None).replace(
+                [float("inf"), float("-inf")], float("nan")
+            )
             return (ret > threshold).fillna(False)
 
         return _groupby_symbol(data, _compute_group)
@@ -187,7 +189,9 @@ def daily_return_below(pct: float = -1.0) -> SignalFunc:
             close = _get_close(group)
             if close is None:
                 return pd.Series(False, index=group.index)
-            ret = close.pct_change()
+            ret = close.pct_change(fill_method=None).replace(
+                [float("inf"), float("-inf")], float("nan")
+            )
             return (ret < threshold).fillna(False)
 
         return _groupby_symbol(data, _compute_group)
@@ -215,7 +219,7 @@ def drawdown_from_high(period: int = 20, pct: float = 5.0) -> SignalFunc:
             if close is None:
                 return pd.Series(False, index=group.index)
             rolling_high = close.rolling(period, min_periods=1).max()
-            dd_ratio = (close - rolling_high) / rolling_high  # negative values
+            dd_ratio = (close - rolling_high) / rolling_high.replace(0, float("nan"))
             return (dd_ratio <= -threshold).fillna(False)
 
         return _groupby_symbol(data, _compute_group)
@@ -238,7 +242,7 @@ def rally_from_low(period: int = 20, pct: float = 5.0) -> SignalFunc:
             if close is None:
                 return pd.Series(False, index=group.index)
             rolling_low = close.rolling(period, min_periods=1).min()
-            rally_ratio = (close - rolling_low) / rolling_low
+            rally_ratio = (close - rolling_low) / rolling_low.replace(0, float("nan"))
             return (rally_ratio >= threshold).fillna(False)
 
         return _groupby_symbol(data, _compute_group)

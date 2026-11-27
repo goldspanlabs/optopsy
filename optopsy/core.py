@@ -26,7 +26,6 @@ Implementation details are split across focused submodules:
 
 from typing import Any, Callable, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 
 from .calendar import (
@@ -42,10 +41,10 @@ from .exits import _apply_early_exits
 from .filters import _apply_signal_filter, _assign_dte
 from .output import _format_calendar_output, _format_output
 from .pricing import (
-    _SHARES_PER_CONTRACT,
     _assign_profit,
     _calculate_commission,
     _calculate_fill_price,
+    _compute_net_pct_change,
 )
 from .timestamps import normalize_dates
 
@@ -122,13 +121,16 @@ def _strategy_engine(
     """
     if len(leg_def) == 1:
         side = leg_def[0][0]
-        has_bid_ask = "bid_entry" in data.columns and "ask_entry" in data.columns
+        data = data.copy()  # Avoid modifying caller's DataFrame
+        has_bid_ask = all(
+            c in data.columns
+            for c in ("bid_entry", "ask_entry", "bid_exit", "ask_exit")
+        )
 
         if has_bid_ask and slippage != "mid":
-            data = data.copy()  # Avoid modifying original DataFrame
             # Calculate fill prices with slippage
             volume_entry = (
-                data.get("volume_entry") if "volume_entry" in data.columns else None
+                data["volume_entry"] if "volume_entry" in data.columns else None
             )
 
             data["entry"] = _calculate_fill_price(
@@ -143,9 +145,7 @@ def _strategy_engine(
                 num_legs=1,
             )
             # Exit: reverse the side (closing the position)
-            volume_exit = (
-                data.get("volume_exit") if "volume_exit" in data.columns else None
-            )
+            volume_exit = data["volume_exit"] if "volume_exit" in data.columns else None
             data["exit"] = _calculate_fill_price(
                 data["bid_exit"],
                 data["ask_exit"],
@@ -160,15 +160,14 @@ def _strategy_engine(
 
         net_pnl = side.value * (data["exit"] - data["entry"])
 
+        comm_dollars: pd.Series | float = 0.0
         if commission is not None:
             comm_per_side = _calculate_commission(leg_def, commission)
             data["total_commission"] = comm_per_side * 2
-            net_pnl = net_pnl - data["total_commission"] / _SHARES_PER_CONTRACT
+            comm_dollars = data["total_commission"]
 
-        data["pct_change"] = np.where(
-            data["entry"].abs() > 0,
-            net_pnl / data["entry"].abs(),
-            np.nan,
+        data["pct_change"] = _compute_net_pct_change(
+            net_pnl, data["entry"], comm_dollars
         )
         return leg_def[0][1](data)
 
@@ -285,6 +284,14 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
     else:
         if not join_on:
             join_on = ["underlying_symbol", "expiration", "dte_entry", "dte_range"]
+        else:
+            join_on = list(join_on)
+        # Ensure all legs close on the same quote_date_exit (prevents merging
+        # mismatched exit dates when exit_dte_tolerance > 0).
+        if "quote_date_exit" not in join_on and all(
+            "quote_date_exit" in lr.columns for lr in leg_results
+        ):
+            join_on.append("quote_date_exit")
 
         partials = [
             _rename_leg_columns(lr, idx, join_on)
@@ -366,12 +373,19 @@ def _process_calendar_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFra
     )
     data = _assign_dte(data)
 
+    # Filter by each leg's option type BEFORE delta selection (avoids evaluating
+    # unneeded option types and respects leg_def[1][1] if legs differ).
+    front_filter = leg_def[0][1]
+    back_filter = leg_def[1][1]
+    front_pool = front_filter(data)
+    back_pool = front_pool if back_filter is front_filter else back_filter(data)
+
     # Get front and back leg options with delta targeting
     front_delta = leg1_delta
     back_delta = leg2_delta if leg2_delta is not None else leg1_delta
 
     front_options = _evaluate_calendar_options(
-        data,
+        front_pool,
         params["front_dte_min"],
         params["front_dte_max"],
         min_bid_ask=params["min_bid_ask"],
@@ -379,17 +393,12 @@ def _process_calendar_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFra
     )
 
     back_options = _evaluate_calendar_options(
-        data,
+        back_pool,
         params["back_dte_min"],
         params["back_dte_max"],
         min_bid_ask=params["min_bid_ask"],
         delta_target=back_delta,
     )
-
-    # Filter by option type (calls or puts) based on leg definition
-    option_filter = leg_def[0][1]
-    front_options = option_filter(front_options)
-    back_options = option_filter(back_options)
 
     # Prepare and merge legs
     front_renamed = _prepare_calendar_leg(front_options, 1, same_strike)
@@ -408,22 +417,15 @@ def _process_calendar_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFra
     if merged.empty:
         return _fmt(merged)
 
-    # Find exit prices
+    # Find exit prices (applying exit_dates before tolerance snapping)
     merged = _find_calendar_exit_prices(
         merged,
         data,
         params["exit_dte"],
         same_strike,
         params["exit_dte_tolerance"],
+        exit_dates=params["exit_dates"],
     )
-
-    if merged.empty:
-        return _fmt(merged)
-
-    # Apply exit date filtering to calendar/diagonal spreads
-    exit_dates = params["exit_dates"]
-    if exit_dates is not None and not merged.empty:
-        merged = _apply_signal_filter(merged, exit_dates, date_col="exit_date")
 
     if merged.empty:
         return _fmt(merged)

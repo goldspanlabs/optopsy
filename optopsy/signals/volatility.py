@@ -36,7 +36,7 @@ def _compute_atr(
 
 
 def _atr_signal(period: int, multiplier: float, above: bool) -> SignalFunc:
-    """Shared ATR regime signal logic."""
+    """Shared ATR regime signal logic using a strictly causal expanding median."""
     period = int(period)
     cmp = operator.gt if above else operator.lt
 
@@ -50,8 +50,9 @@ def _atr_signal(period: int, multiplier: float, above: bool) -> SignalFunc:
             high = group["high"] if has_ohlcv else None
             low = group["low"] if has_ohlcv else None
             atr = _compute_atr(prices, period, high=high, low=low)
-            median_atr = atr.median()
-            if pd.isna(median_atr):
+            # Causal expanding median avoids lookahead bias from future bars
+            median_atr = atr.expanding(min_periods=1).median()
+            if median_atr.isna().all():
                 return pd.Series(False, index=group.index)
             return cmp(atr, multiplier * median_atr).fillna(False)
 
@@ -61,12 +62,12 @@ def _atr_signal(period: int, multiplier: float, above: bool) -> SignalFunc:
 
 
 def atr_above(period: int = 14, multiplier: float = 1.0) -> SignalFunc:
-    """True when ATR exceeds ``multiplier`` times the full-history median ATR."""
+    """True when ATR exceeds ``multiplier`` times the expanding historical median ATR."""
     return _atr_signal(period, multiplier, above=True)
 
 
 def atr_below(period: int = 14, multiplier: float = 1.0) -> SignalFunc:
-    """True when ATR is below ``multiplier`` times the full-history median ATR."""
+    """True when ATR is below ``multiplier`` times the expanding historical median ATR."""
     return _atr_signal(period, multiplier, above=False)
 
 
@@ -75,42 +76,35 @@ def atr_below(period: int = 14, multiplier: float = 1.0) -> SignalFunc:
 # ---------------------------------------------------------------------------
 
 
-def _bb_signal(length: int, std: float, above: bool) -> SignalFunc:
-    """Shared Bollinger Band signal logic."""
+def _bb_bands(length: int, std: float):
     length, std = int(length), float(std)
-    if above:
-        band_col = f"BBU_{length}_{std}"
-        fill_val = float("inf")
-        cmp = operator.gt
-    else:
-        band_col = f"BBL_{length}_{std}"
-        fill_val = float("-inf")
-        cmp = operator.lt
 
-    def _signal(data: pd.DataFrame) -> "pd.Series[bool]":
-        def _compute_group(group: pd.DataFrame) -> "pd.Series[bool]":
-            prices = _get_close(group)
-            if prices is None:
-                return pd.Series(False, index=group.index)
-            bb = ta.bbands(prices, length=length, std=std)
-            if bb is None:
-                return pd.Series(False, index=group.index)
-            band = bb[band_col].fillna(fill_val)
-            return cmp(prices, band).fillna(False)
+    def _compute(group: pd.DataFrame) -> tuple["pd.Series | None", "pd.Series | None"]:
+        prices = _get_close(group)
+        if prices is None:
+            return None, None
+        bb = ta.bbands(prices, length=length, std=std)
+        if bb is None:
+            return None, None
+        upper = lower = None
+        for col in bb.columns:
+            if col.startswith("BBU_"):
+                upper = bb[col]
+            elif col.startswith("BBL_"):
+                lower = bb[col]
+        return upper, lower
 
-        return _groupby_symbol(data, _compute_group)
-
-    return _signal
+    return _compute
 
 
 def bb_above_upper(length: int = 20, std: float = 2.0) -> SignalFunc:
     """True when the underlying price is above the upper Bollinger Band."""
-    return _bb_signal(length, std, above=True)
+    return _band_signal(_bb_bands(length, std), above=True)
 
 
 def bb_below_lower(length: int = 20, std: float = 2.0) -> SignalFunc:
     """True when the underlying price is below the lower Bollinger Band."""
-    return _bb_signal(length, std, above=False)
+    return _band_signal(_bb_bands(length, std), above=False)
 
 
 # ---------------------------------------------------------------------------
@@ -167,21 +161,21 @@ def _donchian_bands(lower_length: int, upper_length: int):
         upper = lower = None
         for col in result.columns:
             if col.startswith("DCU"):
-                upper = result[col]
+                upper = result[col].shift(1)
             elif col.startswith("DCL"):
-                lower = result[col]
+                lower = result[col].shift(1)
         return upper, lower
 
     return _compute
 
 
 def donchian_above_upper(lower_length: int = 20, upper_length: int = 20) -> SignalFunc:
-    """True when price is above the upper Donchian Channel (breakout)."""
+    """True when price breaks above the prior N-bar upper Donchian Channel."""
     return _band_signal(_donchian_bands(lower_length, upper_length), above=True)
 
 
 def donchian_below_lower(lower_length: int = 20, upper_length: int = 20) -> SignalFunc:
-    """True when price is below the lower Donchian Channel (breakdown)."""
+    """True when price breaks below the prior N-bar lower Donchian Channel."""
     return _band_signal(_donchian_bands(lower_length, upper_length), above=False)
 
 

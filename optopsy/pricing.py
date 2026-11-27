@@ -56,13 +56,20 @@ def _calculate_fill_price(
         ratio = 1.0
     elif slippage == "per_leg":
         ratio = min(fill_ratio + per_leg_slippage * (num_legs - 1), 1.0)
-    else:  # liquidity
+    elif slippage == "liquidity":
         if volume is None:
             ratio = fill_ratio
         else:
-            # Higher fill ratio for illiquid options
-            liquidity_score = (volume.fillna(0) / reference_volume).clip(upper=1.0)
+            # Higher fill ratio for illiquid options; clamp negative volume sentinels to 0
+            liquidity_score = (volume.fillna(0) / reference_volume).clip(
+                lower=0.0, upper=1.0
+            )
             ratio = fill_ratio + (1 - fill_ratio) * (1 - liquidity_score)
+    else:
+        raise ValueError(
+            f"Unknown slippage mode {slippage!r}. "
+            "Expected one of: 'mid', 'spread', 'liquidity', 'per_leg'."
+        )
 
     if side_value == 1:  # long - buying at higher price
         return mid + (half_spread * ratio)
@@ -73,6 +80,29 @@ def _calculate_fill_price(
 def _get_leg_quantity(leg: Tuple) -> int:
     """Get quantity for a leg, defaulting to 1 if not specified."""
     return leg[2] if len(leg) > 2 else 1
+
+
+def _compute_net_pct_change(
+    net_pnl: pd.Series | np.ndarray,
+    entry_cost: pd.Series | np.ndarray,
+    commission_dollars: pd.Series | np.ndarray | float = 0.0,
+    min_entry_threshold: float = 0.0,
+) -> np.ndarray:
+    """Compute percentage return after subtracting per-share commission.
+
+    Returns ``np.nan`` where ``abs(entry_cost)`` fails the threshold guard
+    (strictly ``> 0`` when ``min_entry_threshold == 0.0``, or
+    ``>= min_entry_threshold`` when a positive floor is supplied).
+    """
+    adjusted_pnl = np.asarray(net_pnl, dtype=float) - (
+        np.asarray(commission_dollars, dtype=float) / _SHARES_PER_CONTRACT
+    )
+    abs_entry = np.abs(np.asarray(entry_cost, dtype=float))
+    valid = (
+        abs_entry >= min_entry_threshold if min_entry_threshold > 0 else abs_entry > 0
+    )
+    safe_denom = np.where(valid, abs_entry, 1.0)
+    return np.where(valid, adjusted_pnl / safe_denom, np.nan)
 
 
 def _apply_ratios(
@@ -105,8 +135,11 @@ def _apply_ratios(
         # Combined multiplier: direction x quantity, e.g. short 2 calls -> -2
         multiplier = side_value * quantity
 
-        # Check if bid/ask columns exist for slippage calculation
-        has_bid_ask = bid_entry_col in data.columns and ask_entry_col in data.columns
+        # Check that all 4 bid/ask columns exist for slippage calculation
+        has_bid_ask = all(
+            c in data.columns
+            for c in (bid_entry_col, ask_entry_col, bid_exit_col, ask_exit_col)
+        )
 
         if has_bid_ask and slippage != "mid":
             # Slippage recalculates fill prices from raw bid/ask rather than
@@ -212,15 +245,14 @@ def _assign_profit(
 
     net_pnl = data["total_exit_proceeds"] - data["total_entry_cost"]
 
+    comm_dollars: pd.Series | float = 0.0
     if commission is not None:
         comm_per_side = _calculate_commission(leg_def, commission)
         data["total_commission"] = comm_per_side * 2
-        net_pnl = net_pnl - data["total_commission"] / _SHARES_PER_CONTRACT
+        comm_dollars = data["total_commission"]
 
-    data["pct_change"] = np.where(
-        data["total_entry_cost"].abs() > 0,
-        net_pnl / data["total_entry_cost"].abs(),
-        np.nan,
+    data["pct_change"] = _compute_net_pct_change(
+        net_pnl, data["total_entry_cost"], comm_dollars
     )
 
     return data

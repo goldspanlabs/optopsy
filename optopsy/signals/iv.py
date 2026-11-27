@@ -4,6 +4,7 @@ import operator
 
 import pandas as pd
 
+from ..timestamps import normalize_dates
 from ._helpers import SignalFunc
 
 # ---------------------------------------------------------------------------
@@ -23,11 +24,14 @@ def _compute_atm_iv(options_data: pd.DataFrame) -> pd.DataFrame:
     ``signal_dates()`` has been applied before invoking this function
     so that ``close`` is available.
     """
-    if "close" not in options_data.columns:
+    if "close" in options_data.columns:
+        price_col = "close"
+    elif "underlying_price" in options_data.columns:
+        price_col = "underlying_price"
+    else:
         return pd.DataFrame(
             columns=["underlying_symbol", "quote_date", "implied_volatility"]
         )
-    price_col = "close"
 
     _empty_cols = [
         "underlying_symbol",
@@ -38,7 +42,10 @@ def _compute_atm_iv(options_data: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=_empty_cols)
 
+    df["quote_date"] = normalize_dates(pd.to_datetime(df["quote_date"]))
+
     if "expiration" in df.columns:
+        df["expiration"] = normalize_dates(pd.to_datetime(df["expiration"]))
         df["_dte"] = (df["expiration"] - df["quote_date"]).dt.days
         df = df[df["_dte"] > 0]
         if df.empty:
@@ -50,22 +57,16 @@ def _compute_atm_iv(options_data: pd.DataFrame) -> pd.DataFrame:
 
     df["_abs_otm"] = (df["strike"] - df[price_col]).abs()
     idx = df.groupby(["underlying_symbol", "quote_date"])["_abs_otm"].idxmin()
-    atm = df.loc[idx, ["underlying_symbol", "quote_date", "strike"]].copy()
-    merged = atm.merge(
-        df.groupby(["underlying_symbol", "quote_date", "strike"])["implied_volatility"]
-        .mean()
-        .reset_index(),
-        on=["underlying_symbol", "quote_date", "strike"],
-        how="left",
+    atm = df.loc[idx, ["underlying_symbol", "quote_date", "strike"]].drop_duplicates()
+
+    # Semi-join to ATM strikes first so groupby().mean() only aggregates ATM rows
+    atm_rows = df.merge(
+        atm, on=["underlying_symbol", "quote_date", "strike"], how="inner"
     )
     return (
-        merged[
-            [
-                "underlying_symbol",
-                "quote_date",
-                "implied_volatility",
-            ]
-        ]
+        atm_rows.groupby(["underlying_symbol", "quote_date"])["implied_volatility"]
+        .mean()
+        .reset_index()
         .sort_values(["underlying_symbol", "quote_date"])
         .reset_index(drop=True)
     )

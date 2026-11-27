@@ -30,15 +30,16 @@ from ..definitions import (
     straddle_internal_cols,
     triple_strike_internal_cols,
 )
-from ..evaluation import _evaluate_all_options
+from ..evaluation import _evaluate_all_options, _puts
 from ..output import _format_output
 from ..pricing import (
-    _SHARES_PER_CONTRACT,
     _calculate_commission,
     _calculate_fill_price,
+    _compute_net_pct_change,
 )
 from ..rules import (
     _rule_butterfly_strikes,
+    _rule_collar_strikes,
     _rule_expiration_ordering,
     _rule_iron_butterfly_strikes,
     _rule_iron_condor_strikes,
@@ -63,7 +64,18 @@ _DEFAULT_ATM_DELTA = {"target": 0.50, "min": 0.40, "max": 0.60}
 _DEFAULT_OTM_DELTA = {"target": 0.10, "min": 0.05, "max": 0.20}
 _DEFAULT_WING_DELTA = {"target": 0.20, "min": 0.10, "max": 0.30}
 _DEFAULT_DEEP_ITM_DELTA = {"target": 0.80, "min": 0.60, "max": 0.95}
-_DEFAULT_ITM_WING_DELTA = {"target": 0.40, "min": 0.30, "max": 0.50}
+_DEFAULT_ITM_WING_DELTA = {"target": 0.70, "min": 0.55, "max": 0.85}
+_DEFAULT_OTM_WING_DELTA = {"target": 0.30, "min": 0.15, "max": 0.45}
+_DEFAULT_CONDOR_INNER_ITM = {"target": 0.65, "min": 0.55, "max": 0.75}
+_DEFAULT_CONDOR_INNER_OTM = {"target": 0.35, "min": 0.25, "max": 0.45}
+
+_DEFAULT_JOIN_ON = [
+    "underlying_symbol",
+    "expiration",
+    "dte_entry",
+    "dte_range",
+    "quote_date_exit",
+]
 
 
 def _singles(
@@ -95,6 +107,7 @@ def _straddles(
             "strike",
             "dte_entry",
             "dte_range",
+            "quote_date_exit",
         ],
         params=kwargs,
     )
@@ -111,7 +124,7 @@ def _strangles(
         internal_cols=double_strike_internal_cols,
         leg_def=leg_def,
         rules=_rule_non_overlapping_strike,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 
@@ -120,14 +133,21 @@ def _spread(
     data: pd.DataFrame, leg_def: List[Tuple], **kwargs: Unpack[StrategyParamsDict]
 ) -> pd.DataFrame:
     """Process vertical spread strategies (call or put spreads at different strikes)."""
-    kwargs.setdefault("leg1_delta", _DEFAULT_ATM_DELTA)
-    kwargs.setdefault("leg2_delta", _DEFAULT_OTM_DELTA)
+    # Strike-ordering rule enforces strike_leg1 < strike_leg2:
+    # - Calls: lower strike has higher |delta| (leg1 ATM 0.50, leg2 OTM 0.10)
+    # - Puts:  lower strike has lower  |delta| (leg1 OTM 0.10, leg2 ATM 0.50)
+    if leg_def[0][1] is _puts:
+        kwargs.setdefault("leg1_delta", _DEFAULT_OTM_DELTA)
+        kwargs.setdefault("leg2_delta", _DEFAULT_ATM_DELTA)
+    else:
+        kwargs.setdefault("leg1_delta", _DEFAULT_ATM_DELTA)
+        kwargs.setdefault("leg2_delta", _DEFAULT_OTM_DELTA)
     return _process_strategy(
         data,
         internal_cols=double_strike_internal_cols,
         leg_def=leg_def,
         rules=_rule_non_overlapping_strike,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 
@@ -136,15 +156,21 @@ def _butterfly(
     data: pd.DataFrame, leg_def: List[Tuple], **kwargs: Unpack[StrategyParamsDict]
 ) -> pd.DataFrame:
     """Process butterfly strategies (3 legs at different strikes)."""
-    kwargs.setdefault("leg1_delta", _DEFAULT_ITM_WING_DELTA)
-    kwargs.setdefault("leg2_delta", _DEFAULT_ATM_DELTA)
-    kwargs.setdefault("leg3_delta", _DEFAULT_OTM_DELTA)
+    # Ascending strikes: strike_leg1 < strike_leg2 < strike_leg3
+    if leg_def[0][1] is _puts:
+        kwargs.setdefault("leg1_delta", _DEFAULT_OTM_WING_DELTA)
+        kwargs.setdefault("leg2_delta", _DEFAULT_ATM_DELTA)
+        kwargs.setdefault("leg3_delta", _DEFAULT_ITM_WING_DELTA)
+    else:
+        kwargs.setdefault("leg1_delta", _DEFAULT_ITM_WING_DELTA)
+        kwargs.setdefault("leg2_delta", _DEFAULT_ATM_DELTA)
+        kwargs.setdefault("leg3_delta", _DEFAULT_OTM_WING_DELTA)
     return _process_strategy(
         data,
         internal_cols=triple_strike_internal_cols,
         leg_def=leg_def,
         rules=_rule_butterfly_strikes,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 
@@ -162,7 +188,7 @@ def _iron_condor(
         internal_cols=quadruple_strike_internal_cols,
         leg_def=leg_def,
         rules=_rule_iron_condor_strikes,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 
@@ -180,7 +206,7 @@ def _iron_butterfly(
         internal_cols=quadruple_strike_internal_cols,
         leg_def=leg_def,
         rules=_rule_iron_butterfly_strikes,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 
@@ -189,10 +215,11 @@ def _covered_call(
     data: pd.DataFrame,
     leg_def: List[Tuple],
     stock_data: Optional[pd.DataFrame] = None,
+    apply_strike_rule: bool = True,
     **kwargs: Unpack[StrategyParamsDict],
 ) -> pd.DataFrame:
     """
-    Process covered call strategy.
+    Process covered call or protective put strategy.
 
     When *stock_data* is ``None`` (default), the underlying position is
     approximated via a deep ITM call.  When a DataFrame of stock prices
@@ -205,6 +232,8 @@ def _covered_call(
         stock_data: Optional DataFrame of stock prices.  Accepts
             ``yf.download()`` output directly; normalized internally
             via ``_normalize_stock_data()``.
+        apply_strike_rule: Whether to enforce ``strike_leg1 < strike_leg2``
+            in synthetic mode (True for covered call, False for protective put).
         **kwargs: Strategy parameters forwarded to the processing pipeline.
     """
     if stock_data is not None:
@@ -216,8 +245,8 @@ def _covered_call(
         data,
         internal_cols=double_strike_internal_cols,
         leg_def=leg_def,
-        rules=_rule_non_overlapping_strike,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        rules=_rule_non_overlapping_strike if apply_strike_rule else None,
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 
@@ -228,33 +257,43 @@ def _normalize_stock_data(
     """Normalize stock data to the internal format expected by the pipeline.
 
     Accepts stock data from various sources (yfinance, CSV, user-provided
-    DataFrames) and returns a DataFrame with columns:
+    DataFrames) and returns a deduplicated DataFrame with columns:
     ``[underlying_symbol, quote_date, close]``.
 
     Normalization steps:
 
-    1. If the index is a ``DatetimeIndex``, reset it to a column (handles
+    1. Flatten or reshape ``MultiIndex`` columns (yfinance single- or
+       multi-ticker downloads).
+    2. If the index is a ``DatetimeIndex``, reset it to a column (handles
        yfinance output where dates are the index).
-    2. Flatten ``MultiIndex`` columns (yfinance multi-ticker downloads).
     3. Lowercase all column names (``Close`` → ``close``).
     4. Map ``date`` → ``quote_date`` if ``quote_date`` is missing.
     5. If ``underlying_symbol`` is absent, infer it from *options_data*
        (works for single-symbol datasets, raises for multi-symbol).
     """
-    from ..timestamps import normalize_dates
-
     df = stock_data.copy()
 
-    # Flatten MultiIndex columns (yfinance multi-ticker downloads)
+    # Handle MultiIndex columns (yfinance downloads: level 0 = field, level 1 = ticker)
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] for c in df.columns]
+        tickers = df.columns.get_level_values(-1).unique()
+        non_empty_tickers = [t for t in tickers if t != ""]
+        if len(non_empty_tickers) > 1:
+            # Multi-ticker yfinance DataFrame: stack ticker level into rows
+            df = df.stack(level=-1, future_stack=True).reset_index()
+            # Rename stacked ticker column to underlying_symbol
+            if "Ticker" in df.columns:
+                df = df.rename(columns={"Ticker": "underlying_symbol"})
+            elif "level_1" in df.columns:
+                df = df.rename(columns={"level_1": "underlying_symbol"})
+        else:
+            df.columns = [c[0] for c in df.columns]
 
     # Reset DatetimeIndex to a column (yfinance uses date as index)
     if isinstance(df.index, pd.DatetimeIndex):
         df = df.reset_index()
 
     # Lowercase all column names
-    df.columns = [c.lower() for c in df.columns]
+    df.columns = [str(c).lower() for c in df.columns]
 
     # Map common date column names to quote_date
     if "quote_date" not in df.columns:
@@ -286,8 +325,10 @@ def _normalize_stock_data(
             f"quote_date (or date/DatetimeIndex), close."
         )
 
-    df["quote_date"] = normalize_dates(df["quote_date"])
-    return df[["underlying_symbol", "quote_date", "close"]]
+    df["quote_date"] = normalize_dates(pd.to_datetime(df["quote_date"]))
+    return df[["underlying_symbol", "quote_date", "close"]].drop_duplicates(
+        subset=["underlying_symbol", "quote_date"], keep="last"
+    )
 
 
 def _match_stock_prices(
@@ -337,14 +378,19 @@ def _apply_option_slippage(
     slippage = params["slippage"]
     bid_entry_col = f"bid_entry{suffix}"
     ask_entry_col = f"ask_entry{suffix}"
-    if bid_entry_col not in result.columns or ask_entry_col not in result.columns:
+    bid_exit_col = f"bid_exit{suffix}"
+    ask_exit_col = f"ask_exit{suffix}"
+    if not all(
+        c in result.columns
+        for c in (bid_entry_col, ask_entry_col, bid_exit_col, ask_exit_col)
+    ):
         return result
     if slippage == "mid":
         return result
 
     result = result.copy()
     volume_entry = (
-        result.get(f"volume_entry{suffix}")
+        result[f"volume_entry{suffix}"]
         if f"volume_entry{suffix}" in result.columns
         else None
     )
@@ -360,13 +406,13 @@ def _apply_option_slippage(
         num_legs=num_legs,
     )
     volume_exit = (
-        result.get(f"volume_exit{suffix}")
+        result[f"volume_exit{suffix}"]
         if f"volume_exit{suffix}" in result.columns
         else None
     )
     result[f"exit{suffix}"] = _calculate_fill_price(
-        result[f"bid_exit{suffix}"],
-        result[f"ask_exit{suffix}"],
+        result[bid_exit_col],
+        result[ask_exit_col],
         -side_value,
         slippage,
         params["fill_ratio"],
@@ -376,6 +422,19 @@ def _apply_option_slippage(
         num_legs=num_legs,
     )
     return result
+
+
+def _reject_unsupported_stock_early_exits(params: dict) -> None:
+    """Raise NotImplementedError if early exits are requested alongside stock_data."""
+    if (
+        params.get("stop_loss") is not None
+        or params.get("take_profit") is not None
+        or params.get("max_hold_days") is not None
+    ):
+        raise NotImplementedError(
+            "Early exits (stop_loss, take_profit, max_hold_days) are not yet "
+            "supported when using stock_data."
+        )
 
 
 def _covered_with_stock(
@@ -395,17 +454,15 @@ def _covered_with_stock(
     option_side = option_leg[0]
     option_filter = option_leg[1]
 
-    # Only one delta target is needed (for the option leg).  The option is
-    # evaluated as a single leg, so we pass its delta target via
-    # ``leg1_delta`` to the single-leg pipeline.  However, for consistency
-    # with the synthetic 2-leg covered/protective strategies, allow a
-    # user-provided ``leg2_delta`` (which normally controls the option leg)
-    # to take effect when ``leg1_delta`` is not explicitly set.
-    if "leg1_delta" not in kwargs and "leg2_delta" in kwargs:
-        kwargs["leg1_delta"] = kwargs["leg2_delta"]
+    # Prefer leg2_delta (which controls the option leg in the 2-leg public API)
+    # when provided, falling back to leg1_delta or _DEFAULT_DELTA.
+    opt_delta = kwargs.pop("leg2_delta", None)
+    if opt_delta is not None:
+        kwargs["leg1_delta"] = opt_delta
     else:
         kwargs.setdefault("leg1_delta", _DEFAULT_DELTA)
     params = _run_checks(dict(kwargs), data)
+    _reject_unsupported_stock_early_exits(params)
 
     # --- evaluate the option leg ---
     data = data.copy()
@@ -474,7 +531,6 @@ def _covered_with_stock(
             option_leg_def, commission_obj, has_stock_leg=True, num_shares=100
         )
         total_commission = comm_per_side * 2
-        net_pnl = net_pnl - total_commission / _SHARES_PER_CONTRACT
 
     output = pd.DataFrame(
         {
@@ -488,10 +544,8 @@ def _covered_with_stock(
             "strike_leg2": result["strike"].values,
             "total_entry_cost": total_entry.values,
             "total_exit_proceeds": total_exit.values,
-            "pct_change": np.where(
-                total_entry.abs() > 0,
-                net_pnl / total_entry.abs(),
-                np.nan,
+            "pct_change": _compute_net_pct_change(
+                net_pnl, total_entry, total_commission
             ),
             "delta_entry_leg1": 1.0,
             "delta_entry_leg2": (
@@ -547,7 +601,8 @@ def _collar(
         data,
         internal_cols=triple_strike_internal_cols,
         leg_def=leg_def,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        rules=_rule_collar_strikes,
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 
@@ -576,6 +631,7 @@ def _collar_with_stock(
     kwargs["leg1_delta"] = opt1_delta if opt1_delta is not None else _DEFAULT_DELTA
     kwargs["leg2_delta"] = opt2_delta if opt2_delta is not None else _DEFAULT_DELTA
     params = _run_checks(dict(kwargs), data)
+    _reject_unsupported_stock_early_exits(params)
 
     # --- evaluate the option legs via 2-leg spread pipeline ---
     data = data.copy()
@@ -638,6 +694,9 @@ def _collar_with_stock(
         how="inner",
     )
 
+    # Enforce collar strike ordering: long put strike < short call strike
+    result = result[result["strike_opt2"] < result["strike_opt1"]]
+
     if result.empty:
         return _empty_result()
 
@@ -679,7 +738,6 @@ def _collar_with_stock(
             option_leg_def, commission_obj, has_stock_leg=True, num_shares=100
         )
         total_commission = comm_per_side * 2
-        net_pnl = net_pnl - total_commission / _SHARES_PER_CONTRACT
 
     output = pd.DataFrame(
         {
@@ -687,9 +745,9 @@ def _collar_with_stock(
             "underlying_price_entry_leg1": result["_stock_entry"].values,
             "expiration": result["expiration"].values,
             "dte_entry": result["dte_entry"].values,
-            "dte_range": result.get("dte_range", pd.Series(dtype=str)).values
-            if "dte_range" in result.columns
-            else np.nan,
+            "dte_range": (
+                result["dte_range"].values if "dte_range" in result.columns else np.nan
+            ),
             "option_type_leg1": "stock",
             "strike_leg1": result["_stock_entry"].values,
             "option_type_leg2": result["option_type_opt1"].values,
@@ -698,10 +756,8 @@ def _collar_with_stock(
             "strike_leg3": result["strike_opt2"].values,
             "total_entry_cost": total_entry.values,
             "total_exit_proceeds": total_exit.values,
-            "pct_change": np.where(
-                total_entry.abs() > 0,
-                net_pnl / total_entry.abs(),
-                np.nan,
+            "pct_change": _compute_net_pct_change(
+                net_pnl, total_entry, total_commission
             ),
             "delta_entry_leg1": 1.0,
             "delta_entry_leg2": (
@@ -720,8 +776,6 @@ def _collar_with_stock(
     if commission_obj is not None:
         output["total_commission"] = total_commission
 
-    if "dte_range" in result.columns:
-        output["dte_range"] = result["dte_range"].values
     if "delta_range_opt1" in result.columns:
         output["delta_range_leg2"] = result["delta_range_opt1"].values
     if "delta_range_opt2" in result.columns:
@@ -734,16 +788,23 @@ def _condor(
     data: pd.DataFrame, leg_def: List[Tuple], **kwargs: Unpack[StrategyParamsDict]
 ) -> pd.DataFrame:
     """Process condor strategies (4 legs at different strikes, same option type)."""
-    kwargs.setdefault("leg1_delta", _DEFAULT_OTM_DELTA)
-    kwargs.setdefault("leg2_delta", _DEFAULT_DELTA)
-    kwargs.setdefault("leg3_delta", _DEFAULT_DELTA)
-    kwargs.setdefault("leg4_delta", _DEFAULT_OTM_DELTA)
+    # Ascending strikes: strike_leg1 < strike_leg2 < strike_leg3 < strike_leg4
+    if leg_def[0][1] is _puts:
+        kwargs.setdefault("leg1_delta", _DEFAULT_WING_DELTA)
+        kwargs.setdefault("leg2_delta", _DEFAULT_CONDOR_INNER_OTM)
+        kwargs.setdefault("leg3_delta", _DEFAULT_CONDOR_INNER_ITM)
+        kwargs.setdefault("leg4_delta", _DEFAULT_DEEP_ITM_DELTA)
+    else:
+        kwargs.setdefault("leg1_delta", _DEFAULT_DEEP_ITM_DELTA)
+        kwargs.setdefault("leg2_delta", _DEFAULT_CONDOR_INNER_ITM)
+        kwargs.setdefault("leg3_delta", _DEFAULT_CONDOR_INNER_OTM)
+        kwargs.setdefault("leg4_delta", _DEFAULT_WING_DELTA)
     return _process_strategy(
         data,
         internal_cols=quadruple_strike_internal_cols,
         leg_def=leg_def,
         rules=_rule_iron_condor_strikes,
-        join_on=["underlying_symbol", "expiration", "dte_entry", "dte_range"],
+        join_on=_DEFAULT_JOIN_ON,
         params=kwargs,
     )
 

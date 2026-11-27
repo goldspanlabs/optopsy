@@ -14,6 +14,7 @@ def day_of_week(*days: int) -> SignalFunc:
     day_set = set(days)
 
     def _signal(data: pd.DataFrame) -> "pd.Series[bool]":
-        return data["quote_date"].dt.dayofweek.isin(day_set)
+        dates = pd.to_datetime(data["quote_date"])
+        return dates.dt.dayofweek.isin(day_set)
 
     return _signal
