@@ -396,7 +396,9 @@ def _get_intermediate_snapshots(
         return pd.DataFrame(columns=["_trade_id", "quote_date", "_mid"])
 
     # Compute midpoint
-    merged["_mid"] = (merged["bid"] + merged["ask"]) / 2
+    merged["_mid"] = (
+        merged["bid"].astype("float64") + merged["ask"].astype("float64")
+    ) / 2
 
     return merged[["_trade_id", "quote_date", "_mid"]].reset_index(drop=True)
 

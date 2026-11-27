@@ -46,8 +46,10 @@ def _calculate_fill_price(
     Returns:
         Series of fill prices adjusted for slippage
     """
-    mid = (bid + ask) / 2
-    half_spread = (ask - bid) / 2
+    bid_f = pd.Series(_to_float_array(bid), index=bid.index)
+    ask_f = pd.Series(_to_float_array(ask), index=ask.index)
+    mid = (bid_f + ask_f) / 2
+    half_spread = (ask_f - bid_f) / 2
 
     if slippage == "mid":
         return mid

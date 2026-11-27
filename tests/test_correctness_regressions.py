@@ -1620,6 +1620,9 @@ class TestSignalsRegressions:
         assert res["entry"].iloc[0] == pytest.approx(201.0)
         assert res["exit"].iloc[0] == pytest.approx(211.0)
 
+        direct = _calculate_fill_price(df["bid"], df["ask"], 1, "mid")
+        assert list(direct) == pytest.approx([201.0, 211.0])
+
     def test_compute_net_pct_change_handles_nullable_float64_with_pd_na(self):
         """Nullable Float64 Series with pd.NA must map missing rows to np.nan without raising."""
         from optopsy.pricing import _compute_net_pct_change
