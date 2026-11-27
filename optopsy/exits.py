@@ -119,7 +119,9 @@ def _apply_single_leg_exits(
     )
 
     if not triggered.empty:
-        result = _replace_exits_single_leg(result, triggered, data, side_value, params or {})
+        result = _replace_exits_single_leg(
+            result, triggered, data, side_value, params or {}
+        )
 
     result.drop(columns=["_trade_id"], inplace=True)
     return result
@@ -271,7 +273,9 @@ def _apply_multi_leg_exits(
     )
 
     if not triggered.empty:
-        result = _replace_exits_multi_leg(result, triggered, data, leg_def, params or {})
+        result = _replace_exits_multi_leg(
+            result, triggered, data, leg_def, params or {}
+        )
 
     result.drop(columns=["_trade_id"], inplace=True)
     return result
@@ -469,14 +473,21 @@ def _replace_exits_single_leg(
     # Compute new exit prices and pct_change using known side_value
     volume = lookup["volume"] if "volume" in lookup.columns else None
     lookup["_new_exit"] = _calculate_fill_price(
-        lookup["bid"], lookup["ask"], -side_value, params.get("slippage", "mid"),
-        params.get("fill_ratio", 0.5), volume, params.get("reference_volume", 1000),
-        params.get("per_leg_slippage", 0.0), num_legs=1,
+        lookup["bid"],
+        lookup["ask"],
+        -side_value,
+        params.get("slippage", "mid"),
+        params.get("fill_ratio", 0.5),
+        volume,
+        params.get("reference_volume", 1000),
+        params.get("per_leg_slippage", 0.0),
+        num_legs=1,
     )
     entry_price = lookup["entry"]
     commission = (
         lookup["total_commission"] / _SHARES_PER_CONTRACT
-        if "total_commission" in lookup.columns else 0.0
+        if "total_commission" in lookup.columns
+        else 0.0
     )
     lookup["_new_pct"] = np.where(
         entry_price.abs() > 0,
@@ -577,7 +588,14 @@ def _replace_exits_multi_leg(
         # Merge with data at exit date
         leg_lookup = leg_lookup.rename(columns={"_exit_quote_date": "quote_date"})
 
-        data_cols = ["quote_date", "underlying_symbol", "expiration", "strike", "bid", "ask"]
+        data_cols = [
+            "quote_date",
+            "underlying_symbol",
+            "expiration",
+            "strike",
+            "bid",
+            "ask",
+        ]
         if "volume" in data.columns:
             data_cols.append("volume")
         data_merge = data[data_cols].copy()
@@ -612,9 +630,14 @@ def _replace_exits_multi_leg(
 
         volume = merged["volume"] if "volume" in merged.columns else None
         merged["_new_exit"] = _calculate_fill_price(
-            merged[bid_col_data], merged[ask_col_data], -side_value,
-            params.get("slippage", "mid"), params.get("fill_ratio", 0.5), volume,
-            params.get("reference_volume", 1000), params.get("per_leg_slippage", 0.0),
+            merged[bid_col_data],
+            merged[ask_col_data],
+            -side_value,
+            params.get("slippage", "mid"),
+            params.get("fill_ratio", 0.5),
+            volume,
+            params.get("reference_volume", 1000),
+            params.get("per_leg_slippage", 0.0),
             num_legs=n_legs,
         )
 
@@ -679,12 +702,17 @@ def _replace_exits_multi_leg(
 
     commission = (
         result_indexed.loc[valid_trig.index, "total_commission"] / _SHARES_PER_CONTRACT
-        if "total_commission" in result_indexed.columns else 0.0
+        if "total_commission" in result_indexed.columns
+        else 0.0
     )
     result_indexed.loc[valid_trig.index, "pct_change"] = np.where(
         entry_totals.abs() > 0,
-        (np.asarray(new_exit_totals.values) - np.asarray(entry_totals.values)
-         - np.asarray(commission)) / np.asarray(entry_totals.abs().values),
+        (
+            np.asarray(new_exit_totals.values)
+            - np.asarray(entry_totals.values)
+            - np.asarray(commission)
+        )
+        / np.asarray(entry_totals.abs().values),
         np.nan,
     )
 
@@ -695,4 +723,3 @@ def _replace_exits_multi_leg(
 
     result = result_indexed.reset_index()
     return result
-

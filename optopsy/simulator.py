@@ -173,7 +173,8 @@ def _normalise_trades(
 
     df["commission"] = (
         raw["total_commission"].fillna(0.0).values
-        if "total_commission" in raw.columns else 0.0
+        if "total_commission" in raw.columns
+        else 0.0
     )
     return df
 
@@ -590,6 +591,12 @@ def _build_trade_log(
     if trades.empty:
         return pd.DataFrame(columns=_TRADE_LOG_COLUMNS)
 
+    commission = (
+        trades["commission"].fillna(0.0).to_numpy(dtype=float) * quantity
+        if "commission" in trades.columns
+        else np.zeros(len(trades), dtype=float)
+    )
+
     trade_log = pd.DataFrame(
         {
             "trade_id": np.arange(1, len(trades) + 1),
@@ -599,8 +606,7 @@ def _build_trade_log(
             "expiration": trades["expiration"].values,
             "entry_cost": trades["entry_cost"].values,
             "exit_proceeds": trades["exit_proceeds"].values,
-            "commission": trades.get("commission", pd.Series(0.0, index=trades.index)).values
-            * quantity,
+            "commission": commission,
             "quantity": quantity,
             "multiplier": multiplier,
             "pct_change": trades["pct_change"].values,
@@ -949,4 +955,3 @@ def _combine_equity_curves(
     combined = pd.DataFrame(daily_curves).sum(axis=1)
     combined.name = "equity"
     return combined
-

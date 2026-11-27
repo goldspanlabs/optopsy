@@ -135,12 +135,31 @@ def multi_date_spread_data():
 class TestSingleLegStopLoss:
     """Test stop-loss behavior for single-leg strategies."""
 
+    def test_stop_loss_uses_spread_fill_and_commission(self, multi_date_data):
+        result = op.long_calls(
+            multi_date_data,
+            leg1_delta={"target": 0.30, "min": 0.15, "max": 0.40},
+            stop_loss=-0.50,
+            slippage="spread",
+            commission=0.65,
+            raw=True,
+        )
+
+        row = result.iloc[0]
+        assert row["exit_type"] == "stop_loss"
+        assert row["entry"] == pytest.approx(6.10)
+        assert row["exit"] == pytest.approx(2.90)
+        assert row["total_commission"] == pytest.approx(1.30)
+        expected_pct = ((2.90 - 6.10) * 100 - 1.30) / (6.10 * 100)
+        assert row["pct_change"] == pytest.approx(expected_pct)
+
     def test_stop_loss_triggers(self, multi_date_data):
         """Stop-loss should trigger at the first date where P&L <= threshold."""
         result = op.long_calls(
             multi_date_data,
             leg1_delta={"target": 0.30, "min": 0.15, "max": 0.40},
             stop_loss=-0.50,
+            slippage="mid",
             raw=True,
         )
         assert not result.empty
@@ -237,6 +256,7 @@ class TestBothThresholds:
             leg1_delta={"target": 0.30, "min": 0.15, "max": 0.40},
             stop_loss=-0.25,
             take_profit=0.50,
+            slippage="mid",
             raw=True,
         )
         assert not result.empty
@@ -363,6 +383,7 @@ class TestMaxHoldDaysSingleLeg:
             multi_date_data,
             leg1_delta={"target": 0.30, "min": 0.15, "max": 0.40},
             max_hold_days=10,
+            slippage="mid",
             raw=True,
         )
         assert not result.empty
@@ -390,6 +411,7 @@ class TestMaxHoldDaysSingleLeg:
             multi_date_data,
             leg1_delta={"target": 0.30, "min": 0.15, "max": 0.40},
             max_hold_days=5,
+            slippage="mid",
             raw=True,
         )
         assert not result.empty

@@ -479,6 +479,7 @@ class TestSimulateSmoke:
             "multiplier",
             "dollar_cost",
             "dollar_proceeds",
+            "commission",
             "realized_pnl",
             "pct_change",
             "cumulative_pnl",
@@ -487,6 +488,23 @@ class TestSimulateSmoke:
             "exit_type",
         }
         assert expected == set(result.trade_log.columns)
+
+    def test_commission_is_deducted_from_realized_pnl_and_equity(self, data):
+        result = simulate(
+            data,
+            op.long_calls,
+            selector="first",
+            slippage="mid",
+            commission=0.65,
+        )
+
+        trade = result.trade_log.iloc[0]
+        expected_pnl = (trade["exit_proceeds"] - trade["entry_cost"]) * trade[
+            "quantity"
+        ] * trade["multiplier"] - 1.30
+        assert trade["commission"] == pytest.approx(1.30)
+        assert trade["realized_pnl"] == pytest.approx(expected_pnl)
+        assert trade["equity"] == pytest.approx(100_000 + expected_pnl)
 
     def test_summary_keys(self, data):
         result = simulate(data, op.long_calls)
@@ -1554,6 +1572,7 @@ class TestSimulateEarlyExits:
             op.long_calls,
             selector="first",
             stop_loss=-0.40,
+            slippage="mid",
         )
         assert result.summary["total_trades"] == 1
         trade = result.trade_log.iloc[0]
@@ -1591,6 +1610,7 @@ class TestSimulateEarlyExits:
             op.long_calls,
             selector="first",
             stop_loss=-0.40,
+            slippage="mid",
         )
         trade = result.trade_log.iloc[0]
         # pct_change should be near -50% (day 10 price = 3.00, entry = 6.00)
@@ -1603,6 +1623,7 @@ class TestSimulateEarlyExits:
             op.long_calls,
             selector="first",
             stop_loss=-0.40,
+            slippage="mid",
         )
         result_normal = simulate(
             early_exit_sim_data,
