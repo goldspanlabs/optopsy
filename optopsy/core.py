@@ -36,7 +36,7 @@ from .calendar import (
     _prepare_calendar_leg,
 )
 from .checks import _run_calendar_checks, _run_checks
-from .evaluation import _evaluate_all_options
+from .evaluation import _calls, _evaluate_all_options, _puts
 from .exits import _apply_early_exits
 from .filters import _apply_signal_filter, _assign_dte
 from .output import _format_calendar_output, _format_output
@@ -208,6 +208,80 @@ def _widen_numeric_columns(data: pd.DataFrame) -> None:
             )
 
 
+def _prepare_data(data: pd.DataFrame) -> pd.DataFrame:
+    """Return a normalized copy of raw option chain data.
+
+    Normalizes date columns and lower-cases ``option_type`` once at the root so
+    all downstream merges (signal filtering, entry/exit matching, ``_calls`` /
+    ``_puts``) work regardless of source.  Also widens integer/nullable numeric
+    columns to float64 to prevent narrow integer overflow (e.g. uint8 bid/ask)
+    or ``pd.NA`` arithmetic failures.
+    """
+    data = data.copy()
+    data["quote_date"] = normalize_dates(data["quote_date"])
+    data["expiration"] = normalize_dates(data["expiration"])
+    data["option_type"] = data["option_type"].str.lower()
+    _widen_numeric_columns(data)
+    return data
+
+
+def _has_early_exit(params: dict) -> bool:
+    """True if any early-exit rule (stop-loss, take-profit, max hold) is set."""
+    return (
+        params.get("stop_loss") is not None
+        or params.get("take_profit") is not None
+        or params.get("max_hold_days") is not None
+    )
+
+
+def _evaluate_leg(
+    leg_data: pd.DataFrame,
+    params: dict,
+    delta_target: dict,
+    select_closest_exit: bool = True,
+) -> pd.DataFrame:
+    """Evaluate one leg's entry/exit matching using validated strategy params."""
+    return _evaluate_all_options(
+        leg_data,
+        dte_interval=params["dte_interval"],
+        max_entry_dte=params["max_entry_dte"],
+        exit_dte=params["exit_dte"],
+        exit_dte_tolerance=params["exit_dte_tolerance"],
+        min_bid_ask=params["min_bid_ask"],
+        delta_target=delta_target["target"],
+        delta_range_min=delta_target["min"],
+        delta_range_max=delta_target["max"],
+        delta_interval=params["delta_interval"],
+        entry_dates=params["entry_dates"],
+        exit_dates=params["exit_dates"],
+        select_closest_exit=select_closest_exit,
+    )
+
+
+def _keep_closest_exit_per_position(
+    result: pd.DataFrame, pos_cols: List[str], exit_dte: int
+) -> pd.DataFrame:
+    """Keep one row per position: the exit date closest to the target ``exit_dte``.
+
+    Used by multi-leg paths when ``exit_dte_tolerance > 0`` retains every
+    eligible exit candidate until all legs have been merged on a common exit.
+    """
+    actual_exit_dte = (result["expiration"] - result["quote_date_exit"]).dt.days
+    return (
+        result.assign(
+            _exit_dte_diff=(actual_exit_dte - exit_dte).abs(),
+            _exit_dte_actual=actual_exit_dte,
+        )
+        .sort_values(
+            ["_exit_dte_diff", "_exit_dte_actual", "quote_date_exit"],
+            kind="mergesort",
+        )
+        .drop_duplicates(subset=pos_cols, keep="first")
+        .drop(columns=["_exit_dte_diff", "_exit_dte_actual"])
+        .reset_index(drop=True)
+    )
+
+
 def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
     """
     Main entry point for processing option strategies.
@@ -225,16 +299,7 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
     """
     params = _run_checks(context["params"], data)
 
-    # Normalize date columns once at the root so all downstream merges
-    # (signal filtering, entry/exit matching) work regardless of source.
-    # Also widen integer/nullable numeric columns to float64 to prevent narrow
-    # integer overflow (e.g. uint8 bid/ask) or pd.NA arithmetic failures.
-    data = data.copy()
-    data["quote_date"] = normalize_dates(data["quote_date"])
-    data["expiration"] = normalize_dates(data["expiration"])
-    # Normalize option_type once so _calls/_puts avoid repeated .str.lower() calls
-    data["option_type"] = data["option_type"].str.lower()
-    _widen_numeric_columns(data)
+    data = _prepare_data(data)
 
     leg_def = context["leg_def"]
     leg_deltas = [params.get(f"leg{i}_delta") for i in range(1, 5)]
@@ -251,8 +316,6 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
     join_on = context.get("join_on")
 
     # Pre-filter only the option types actually needed by this strategy
-    from .evaluation import _calls, _puts
-
     needed_filters = {leg[1] for leg in leg_def}
     _prefiltered = {f: f(data) for f in needed_filters if f in (_calls, _puts)}
 
@@ -269,21 +332,7 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
         if leg_data is None:
             leg_data = option_filter(data)
 
-        evaluated = _evaluate_all_options(
-            leg_data,
-            dte_interval=params["dte_interval"],
-            max_entry_dte=params["max_entry_dte"],
-            exit_dte=params["exit_dte"],
-            exit_dte_tolerance=params["exit_dte_tolerance"],
-            min_bid_ask=params["min_bid_ask"],
-            delta_target=delta_target["target"],
-            delta_range_min=delta_target["min"],
-            delta_range_max=delta_target["max"],
-            delta_interval=params["delta_interval"],
-            entry_dates=params["entry_dates"],
-            exit_dates=params["exit_dates"],
-            select_closest_exit=select_closest_exit,
-        )
+        evaluated = _evaluate_leg(leg_data, params, delta_target, select_closest_exit)
         leg_results.append(evaluated)
 
     # Build external_cols with delta_range_legN
@@ -354,27 +403,12 @@ def _process_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFrame:
                 )
                 if c in result.columns
             ]
-            actual_exit_dte = (result["expiration"] - result["quote_date_exit"]).dt.days
-            result = result.assign(
-                _exit_dte_diff=(actual_exit_dte - params["exit_dte"]).abs(),
-                _exit_dte_actual=actual_exit_dte,
-            )
-            result = (
-                result.sort_values(
-                    ["_exit_dte_diff", "_exit_dte_actual", "quote_date_exit"],
-                    kind="mergesort",
-                )
-                .drop_duplicates(subset=pos_cols, keep="first")
-                .drop(columns=["_exit_dte_diff", "_exit_dte_actual"])
-                .reset_index(drop=True)
+            result = _keep_closest_exit_per_position(
+                result, pos_cols, params["exit_dte"]
             )
 
     # Apply early exits (stop-loss / take-profit / max-hold-days) if configured
-    if (
-        params.get("stop_loss") is not None
-        or params.get("take_profit") is not None
-        or params.get("max_hold_days") is not None
-    ):
+    if _has_early_exit(params):
         result = _apply_early_exits(result, data, leg_def, params)
 
     return _format_output(
@@ -423,14 +457,8 @@ def _process_calendar_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFra
             df, params, internal_cols, external_cols, same_strike
         )
 
-    # Normalize dates/option_type once at the root; _assign_dte returns a new
-    # DataFrame via .assign(), so no explicit .copy() needed.
-    data = data.assign(
-        quote_date=normalize_dates(data["quote_date"]),
-        expiration=normalize_dates(data["expiration"]),
-        option_type=data["option_type"].str.lower(),
-    )
-    _widen_numeric_columns(data)
+    # Normalize once at the root; _assign_dte returns a new DataFrame.
+    data = _prepare_data(data)
     data = _assign_dte(data)
 
     # Filter by each leg's option type BEFORE delta selection (avoids evaluating
@@ -505,11 +533,7 @@ def _process_calendar_strategy(data: pd.DataFrame, **context: Any) -> pd.DataFra
     )
 
     # Apply early exits (stop-loss / take-profit / max-hold-days) if configured
-    if (
-        params.get("stop_loss") is not None
-        or params.get("take_profit") is not None
-        or params.get("max_hold_days") is not None
-    ):
+    if _has_early_exit(params):
         merged = _apply_early_exits(merged, data, leg_def, params)
 
     return _fmt(merged)
