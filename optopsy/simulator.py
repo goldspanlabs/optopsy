@@ -262,29 +262,22 @@ def _normalise_trades(
     return df
 
 
-def _normalise_single_leg(raw: pd.DataFrame, *, negate: bool = False) -> pd.DataFrame:
-    entry_date = _resolve_entry_date(raw)
-    expiration = _resolve_expiration(raw)
+def _const_series(raw: pd.DataFrame, value: Any) -> pd.Series:
+    """Constant-valued Series aligned to *raw*'s index."""
+    return pd.Series([value] * len(raw), index=raw.index)
 
-    # Derive exit date: if dte_entry exists we can compute exit_dte from the
-    # strategy params, but the raw output doesn't carry exit_dte directly.
-    # For single-leg trades the exit is at expiration (exit_dte=0) or at
-    # expiration minus the remaining DTE.  Since we don't have exit quote_date
-    # in the raw output, approximate exit_date = expiration.
-    exit_date = expiration
 
-    option_type = raw.get("option_type", pd.Series([""] * len(raw), index=raw.index))
-    strike = raw.get("strike", pd.Series([np.nan] * len(raw), index=raw.index))
-    desc = option_type.astype(str) + " " + strike.astype(str)  # type: ignore[operator]
-
-    # For short single-leg strategies, negate prices to signed cash flows:
-    # selling at entry = credit (negative cost), buying back at exit = debit
-    # (negative proceeds).  This aligns with multi-leg convention where
-    # total_entry_cost < 0 means credit.
-    sign = -1 if negate else 1
-    entry_cost = raw["entry"] * sign
-    exit_proceeds = raw["exit"] * sign
-
+def _normalised_frame(
+    raw: pd.DataFrame,
+    *,
+    entry_date: pd.Series,
+    exit_date: pd.Series,
+    expiration: pd.Series,
+    entry_cost: pd.Series,
+    exit_proceeds: pd.Series,
+    description: pd.Series,
+) -> pd.DataFrame:
+    """Assemble the uniform trade schema shared by every strategy shape."""
     return pd.DataFrame(
         {
             "entry_date": entry_date,
@@ -294,15 +287,39 @@ def _normalise_single_leg(raw: pd.DataFrame, *, negate: bool = False) -> pd.Data
             "entry_cost": entry_cost,
             "exit_proceeds": exit_proceeds,
             "pct_change": raw["pct_change"],
-            "description": desc,
+            "description": description,
         }
     )
 
 
-def _normalise_multi_leg(raw: pd.DataFrame) -> pd.DataFrame:
-    entry_date = _resolve_entry_date(raw)
+def _normalise_single_leg(raw: pd.DataFrame, *, negate: bool = False) -> pd.DataFrame:
     expiration = _resolve_expiration(raw)
-    exit_date = expiration
+
+    option_type = raw.get("option_type", _const_series(raw, ""))
+    strike = raw.get("strike", _const_series(raw, np.nan))
+    desc = option_type.astype(str) + " " + strike.astype(str)  # type: ignore[operator]
+
+    # For short single-leg strategies, negate prices to signed cash flows:
+    # selling at entry = credit (negative cost), buying back at exit = debit
+    # (negative proceeds).  This aligns with multi-leg convention where
+    # total_entry_cost < 0 means credit.
+    sign = -1 if negate else 1
+
+    # The raw output has no exit quote_date for single-leg trades, so the
+    # exit is approximated by expiration (refined later in _normalise_trades).
+    return _normalised_frame(
+        raw,
+        entry_date=_resolve_entry_date(raw),
+        exit_date=expiration,
+        expiration=expiration,
+        entry_cost=raw["entry"] * sign,
+        exit_proceeds=raw["exit"] * sign,
+        description=desc,
+    )
+
+
+def _normalise_multi_leg(raw: pd.DataFrame) -> pd.DataFrame:
+    expiration = _resolve_expiration(raw)
 
     # Build a human-readable description from available strike/type columns
     desc_parts = [
@@ -313,47 +330,38 @@ def _normalise_multi_leg(raw: pd.DataFrame) -> pd.DataFrame:
     desc = (
         reduce(lambda a, b: a + "/" + b, desc_parts)
         if desc_parts
-        else pd.Series(["multi-leg"] * len(raw), index=raw.index)
+        else _const_series(raw, "multi-leg")
     )
 
-    return pd.DataFrame(
-        {
-            "entry_date": entry_date,
-            "exit_date": exit_date,
-            "expiration": expiration,
-            "underlying_symbol": raw["underlying_symbol"],
-            "entry_cost": raw["total_entry_cost"],
-            "exit_proceeds": raw["total_exit_proceeds"],
-            "pct_change": raw["pct_change"],
-            "description": desc,
-        }
+    return _normalised_frame(
+        raw,
+        entry_date=_resolve_entry_date(raw),
+        exit_date=expiration,
+        expiration=expiration,
+        entry_cost=raw["total_entry_cost"],
+        exit_proceeds=raw["total_exit_proceeds"],
+        description=desc,
     )
 
 
 def _normalise_calendar(raw: pd.DataFrame) -> pd.DataFrame:
-    entry_date = _resolve_entry_date(raw)
-
     # Exit date = front expiration (leg1) — the spread is typically closed
     # near front expiration
     exit_date = pd.to_datetime(raw["expiration_leg1"])
-    expiration = exit_date
 
     strike_col = "strike" if "strike" in raw.columns else "strike_leg1"
-    strike = raw.get(strike_col, pd.Series([np.nan] * len(raw), index=raw.index))
-    option_type = raw.get("option_type", pd.Series([""] * len(raw), index=raw.index))
+    strike = raw.get(strike_col, _const_series(raw, np.nan))
+    option_type = raw.get("option_type", _const_series(raw, ""))
     desc = "cal " + option_type.astype(str) + " " + strike.astype(str)  # type: ignore[operator]
 
-    return pd.DataFrame(
-        {
-            "entry_date": entry_date,
-            "exit_date": exit_date,
-            "expiration": expiration,
-            "underlying_symbol": raw["underlying_symbol"],
-            "entry_cost": raw["total_entry_cost"],
-            "exit_proceeds": raw["total_exit_proceeds"],
-            "pct_change": raw["pct_change"],
-            "description": desc,
-        }
+    return _normalised_frame(
+        raw,
+        entry_date=_resolve_entry_date(raw),
+        exit_date=exit_date,
+        expiration=exit_date,
+        entry_cost=raw["total_entry_cost"],
+        exit_proceeds=raw["total_exit_proceeds"],
+        description=desc,
     )
 
 
