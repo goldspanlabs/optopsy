@@ -18,8 +18,6 @@ Example:
 For detailed documentation, visit: https://github.com/goldspanlabs/optopsy
 """
 
-__version__ = "2.4.0"
-
 from .datafeeds import csv_data, load_cached_options, load_cached_stocks, options_data
 from .metrics import (
     calmar_ratio,
@@ -192,7 +190,6 @@ from .types import (
 )
 
 __all__ = [
-    "__version__",
     "long_calls",
     "long_puts",
     "short_calls",
