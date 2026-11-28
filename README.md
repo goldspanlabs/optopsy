@@ -20,12 +20,12 @@ Optopsy is a Python backtesting engine that lets you go from *"How do 45-DTE iro
 
 ## Features
 
-- **38 Built-in Strategies** - From simple calls/puts to iron condors, butterflies, condors, ratio spreads, collars, calendars, and diagonals
+- **40 Built-in Strategies** - From simple calls/puts to iron condors, butterflies, condors, ratio spreads, collars, calendars, and diagonals
 - **Per-Leg Delta Targeting** - Select strikes by delta with `target, min, max` per leg
 - **Trade Simulator** - Chronological simulation with capital tracking, position limits, and equity curves via `simulate()`
 - **Portfolio Simulation** - Weighted multi-strategy portfolio backtesting via `simulate_portfolio()`
 - **Early Exits** - Stop-loss, take-profit, and max-hold-days rules for automatic position management
-- **Commissions** - Model broker fees with per-contract, base fee, and min fee structures
+- **Commissions** - Model broker fees with per-contract, per-share, base fee, and min fee structures
 - **Risk Metrics** - Sharpe, Sortino, VaR, CVaR, Calmar, Omega, tail ratio, and more via `compute_risk_metrics()`
 - **80+ Entry Signals** - Filter entries with TA indicators (RSI, MACD, Bollinger Bands, EMA, ATR, IV Rank) via [pandas-ta-classic](https://github.com/xgboosted/pandas-ta-classic)
 - **Custom Signals** - Use `custom_signal()` to drive entries from any DataFrame with a boolean flag column
@@ -126,7 +126,7 @@ print(result.trade_log)       # per-trade P&L, entry/exit dates, equity
 print(result.equity_curve)    # portfolio value over time
 ```
 
-The simulator works with all 38 strategies. It selects one trade per entry date, enforces concurrent position limits, and computes a full equity curve with metrics like win rate, profit factor, max drawdown, and average days in trade.
+The simulator works with all 40 strategies. It selects one trade per entry date, enforces concurrent position limits, and computes a full equity curve with metrics like win rate, profit factor, max drawdown, and average days in trade.
 
 ## Supported Strategies
 
@@ -147,7 +147,7 @@ The simulator works with all 38 strategies. It selects one trade per entry date,
 ## Documentation
 
 - [Getting Started](https://goldspanlabs.github.io/optopsy/getting-started/) - Installation and first backtest
-- [Strategies](https://goldspanlabs.github.io/optopsy/strategies/) - All 38 strategies explained
+- [Strategies](https://goldspanlabs.github.io/optopsy/strategies/) - All 40 strategies explained
 - [Parameters](https://goldspanlabs.github.io/optopsy/parameters/) - Configuration options reference
 - [Entry Signals](https://goldspanlabs.github.io/optopsy/entry-signals/) - Technical analysis signal filters
 - [Data Management](https://goldspanlabs.github.io/optopsy/data/) - Standalone data CLI and caching

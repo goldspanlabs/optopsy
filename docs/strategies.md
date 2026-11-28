@@ -1,6 +1,6 @@
 # Strategy Overview
 
-Optopsy includes 38 built-in options strategies covering single-leg, multi-leg, ratio, and time-based strategies.
+Optopsy includes 40 built-in options strategies covering single-leg, multi-leg, ratio, and time-based strategies.
 
 ## Strategy Categories
 

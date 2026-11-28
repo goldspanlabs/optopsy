@@ -8,12 +8,12 @@ Optopsy combines a Python backtesting engine with an optional conversational AI 
 
 ## Key Features
 
-- **38 Built-in Strategies** - From simple calls/puts to iron condors, butterflies, condors, ratio spreads, collars, calendars, and diagonals
+- **40 Built-in Strategies** - From simple calls/puts to iron condors, butterflies, condors, ratio spreads, collars, calendars, and diagonals
 - **Per-Leg Delta Targeting** - Select strikes by delta with `TargetRange(target, min, max)` per leg
 - **Strategy Simulation** - Chronological simulation with capital tracking, position limits, and equity curves via `simulate()`
 - **Portfolio Simulation** - Weighted multi-strategy portfolio backtesting via `simulate_portfolio()`
 - **Early Exits** - Stop-loss, take-profit, and max-hold-days rules for automatic position management
-- **Commissions** - Model broker fees with per-contract, base fee, and min fee structures
+- **Commissions** - Model broker fees with per-contract, per-share, base fee, and min fee structures
 - **Risk Metrics** - Sharpe, Sortino, VaR, CVaR, Calmar, Omega, tail ratio, and more via `compute_risk_metrics()`
 - **Entry Signals** - Filter entries with TA indicators (RSI, MACD, Bollinger Bands, EMA, ATR, IV Rank) via [pandas-ta-classic](https://github.com/xgboosted/pandas-ta-classic)
 - **Custom Signals** - Use `custom_signal()` to drive entries from any DataFrame with a boolean flag column
