@@ -68,14 +68,18 @@ def _apply_early_exits(
 
     result = result.copy()
 
-    if len(leg_def) == 1:
-        return _apply_single_leg_exits(
-            result, data, leg_def, stop_loss, take_profit, max_hold_days, params
-        )
-    else:
-        return _apply_multi_leg_exits(
-            result, data, leg_def, stop_loss, take_profit, max_hold_days, params
-        )
+    # Bookkeeping columns shared by both paths; _trade_id is internal only.
+    result["_trade_id"] = np.arange(len(result))
+    result["exit_type"] = "expiration"
+    result["_early_exit_date"] = pd.NaT
+
+    apply_exits = (
+        _apply_single_leg_exits if len(leg_def) == 1 else _apply_multi_leg_exits
+    )
+    result = apply_exits(
+        result, data, leg_def, stop_loss, take_profit, max_hold_days, params
+    )
+    return result.drop(columns=["_trade_id"])
 
 
 def _apply_single_leg_exits(
@@ -94,11 +98,6 @@ def _apply_single_leg_exits(
     """
     side_value = leg_def[0][0].value  # +1 (long) or -1 (short)
 
-    # Assign trade IDs for tracking
-    result["_trade_id"] = np.arange(len(result))
-    result["exit_type"] = "expiration"
-    result["_early_exit_date"] = pd.NaT
-
     # Get intermediate snapshots strictly between entry and planned exit
     contract_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
     exit_date_col = _resolve_col(result, ("quote_date_exit", "exit_date"))
@@ -111,7 +110,6 @@ def _apply_single_leg_exits(
     )
 
     if intermediates.empty:
-        result.drop(columns=["_trade_id"], inplace=True)
         return result
 
     # Merge entry price and entry date onto intermediates
@@ -136,7 +134,6 @@ def _apply_single_leg_exits(
             result, triggered, data, side_value, params or {}
         )
 
-    result.drop(columns=["_trade_id"], inplace=True)
     return result
 
 
@@ -156,10 +153,6 @@ def _apply_multi_leg_exits(
     before checking thresholds.
     """
     n_legs = len(leg_def)
-    result["_trade_id"] = np.arange(len(result))
-    result["exit_type"] = "expiration"
-    result["_early_exit_date"] = pd.NaT
-
     contract_cols = ["underlying_symbol", "option_type", "expiration", "strike"]
 
     # Determine whether trades already carry a planned exit date column; only
@@ -208,7 +201,6 @@ def _apply_multi_leg_exits(
         strike_col = _resolve_col(result, (f"strike_leg{idx}", "strike"))
 
         if exp_col is None or entry_col_name is None:
-            result.drop(columns=["_trade_id"], inplace=True)
             return result
 
         # Build a clean lookup DataFrame with generic contract column names
@@ -237,7 +229,6 @@ def _apply_multi_leg_exits(
         )
 
         if intermediates.empty:
-            result.drop(columns=["_trade_id"], inplace=True)
             return result
 
         # Get entry price for this leg
@@ -269,7 +260,6 @@ def _apply_multi_leg_exits(
         combined = combined.merge(li, on=["_trade_id", "quote_date"], how="inner")
 
     if combined.empty:
-        result.drop(columns=["_trade_id"], inplace=True)
         return result
 
     # Merge entry date for max_hold_days calculation
@@ -306,7 +296,6 @@ def _apply_multi_leg_exits(
             result, triggered, data, leg_def, params or {}
         )
 
-    result.drop(columns=["_trade_id"], inplace=True)
     return result
 
 
@@ -470,6 +459,57 @@ def _find_first_threshold_crossing(
     )
 
 
+def _trigger_lookup(triggered: pd.DataFrame) -> pd.DataFrame:
+    """Reduce threshold-crossing rows to ``_trade_id`` / ``_exit_quote_date`` / ``_exit_type``."""
+    return triggered[["_trade_id", "quote_date", "_exit_type"]].rename(
+        columns={"quote_date": "_exit_quote_date"}
+    )
+
+
+def _exit_quotes_at(
+    data: pd.DataFrame, key_cols: List[str], quote_dates: Any
+) -> pd.DataFrame:
+    """Raw-chain bid/ask(/volume) quotes on *quote_dates*, one row per *key_cols*.
+
+    Pre-filters to the triggered dates before deduplicating so the
+    drop_duplicates runs on a small frame.
+    """
+    price_cols = ["bid", "ask"] + (["volume"] if "volume" in data.columns else [])
+    quotes = cast(
+        pd.DataFrame,
+        data.loc[data["quote_date"].isin(quote_dates), key_cols + price_cols],
+    )
+    return quotes.drop_duplicates(subset=key_cols, keep="first")
+
+
+def _exit_fill_price(
+    quotes: pd.DataFrame, side_value: int, params: Dict[str, Any], num_legs: int
+) -> pd.Series:
+    """Fill price for closing a leg (opposite of its entry side) at *quotes*' bid/ask."""
+    return _calculate_fill_price(
+        quotes["bid"],
+        quotes["ask"],
+        -side_value,
+        params.get("slippage", "mid"),
+        params.get("fill_ratio", 0.5),
+        quotes["volume"] if "volume" in quotes.columns else None,
+        params.get("reference_volume", 1000),
+        params.get("per_leg_slippage", 0.0),
+        num_legs=num_legs,
+    )
+
+
+def _mark_early_exit(
+    result_indexed: pd.DataFrame,
+    index: pd.Index,
+    exit_types: Any,
+    exit_dates: Any,
+) -> None:
+    """Record exit type and early-exit date for triggered trades (in place)."""
+    result_indexed.loc[index, "exit_type"] = np.asarray(exit_types)
+    result_indexed.loc[index, "_early_exit_date"] = pd.to_datetime(exit_dates).values
+
+
 def _replace_exits_single_leg(
     result: pd.DataFrame,
     triggered: pd.DataFrame,
@@ -484,9 +524,7 @@ def _replace_exits_single_leg(
     exit date in quote_date_exit (if present) is not modified; the actual
     early-exit quote date is stored in _early_exit_date.
     """
-    trig_trades = triggered[["_trade_id", "quote_date", "_exit_type"]].rename(
-        columns={"quote_date": "_exit_quote_date"}
-    )
+    trig_trades = _trigger_lookup(triggered)
 
     result_cols = ["_trade_id", "underlying_symbol", "expiration", "strike", "entry"]
     if "total_commission" in result.columns:
@@ -502,31 +540,16 @@ def _replace_exits_single_leg(
 
     lookup = lookup.rename(columns={"_exit_quote_date": "quote_date"})
     data_exit_keys = ["quote_date"] + data_merge_cols
-    exit_price_cols = ["bid", "ask"] + (["volume"] if "volume" in data.columns else [])
 
     # Pre-filter raw chain to triggered exit dates before deduplicating
-    trig_dates = lookup["quote_date"].unique()
-    data_exit = data.loc[
-        data["quote_date"].isin(trig_dates), data_exit_keys + exit_price_cols
-    ].drop_duplicates(subset=data_exit_keys, keep="first")
+    data_exit = _exit_quotes_at(data, data_exit_keys, lookup["quote_date"].unique())
 
     lookup = lookup.merge(data_exit, on=data_exit_keys, how="inner")
 
     if lookup.empty:
         return result
 
-    volume = lookup["volume"] if "volume" in lookup.columns else None
-    lookup["_new_exit"] = _calculate_fill_price(
-        lookup["bid"],
-        lookup["ask"],
-        -side_value,
-        params.get("slippage", "mid"),
-        params.get("fill_ratio", 0.5),
-        volume,
-        params.get("reference_volume", 1000),
-        params.get("per_leg_slippage", 0.0),
-        num_legs=1,
-    )
+    lookup["_new_exit"] = _exit_fill_price(lookup, side_value, params, num_legs=1)
     comm_dollars = (
         lookup["total_commission"] if "total_commission" in lookup.columns else 0.0
     )
@@ -545,10 +568,9 @@ def _replace_exits_single_leg(
 
     result_indexed.loc[updates.index, "exit"] = updates["_new_exit"].values
     result_indexed.loc[updates.index, "pct_change"] = updates["_new_pct"].values
-    result_indexed.loc[updates.index, "exit_type"] = updates["_exit_type"].values
-    result_indexed.loc[updates.index, "_early_exit_date"] = pd.to_datetime(
-        updates["quote_date"]
-    ).values
+    _mark_early_exit(
+        result_indexed, updates.index, updates["_exit_type"], updates["quote_date"]
+    )
 
     if "dte_exit" in result_indexed.columns and "expiration" in result_indexed.columns:
         new_dte = (updates["expiration"] - updates["quote_date"]).dt.days
@@ -567,9 +589,7 @@ def _replace_exits_multi_leg(
     """Replace exit data for triggered multi-leg trades (including straddles and calendars)."""
     n_legs = len(leg_def)
 
-    trig_trades = triggered[["_trade_id", "quote_date", "_exit_type"]].rename(
-        columns={"quote_date": "_exit_quote_date"}
-    )
+    trig_trades = _trigger_lookup(triggered)
 
     # Collect result columns needed for per-leg contract lookup
     result_cols = ["_trade_id", "underlying_symbol"]
@@ -600,13 +620,7 @@ def _replace_exits_multi_leg(
     merge_cols = ["quote_date", "underlying_symbol", "expiration", "strike"]
     if has_opt_type:
         merge_cols.append("option_type")
-    data_cols = (
-        merge_cols + ["bid", "ask"] + (["volume"] if "volume" in data.columns else [])
-    )
-    trig_dates = lookup["_exit_quote_date"].unique()
-    data_merge = data.loc[
-        data["quote_date"].isin(trig_dates), data_cols
-    ].drop_duplicates(subset=merge_cols, keep="first")
+    data_merge = _exit_quotes_at(data, merge_cols, lookup["_exit_quote_date"].unique())
 
     if data_merge.empty:
         return result
@@ -653,17 +667,8 @@ def _replace_exits_multi_leg(
         if not valid_ids:
             return result
 
-        volume = merged["volume"] if "volume" in merged.columns else None
-        merged["_new_exit"] = _calculate_fill_price(
-            merged["bid"],
-            merged["ask"],
-            -side_value,
-            params.get("slippage", "mid"),
-            params.get("fill_ratio", 0.5),
-            volume,
-            params.get("reference_volume", 1000),
-            params.get("per_leg_slippage", 0.0),
-            num_legs=n_legs,
+        merged["_new_exit"] = _exit_fill_price(
+            merged, side_value, params, num_legs=n_legs
         )
 
         leg_updates[leg_idx] = (
@@ -733,9 +738,11 @@ def _replace_exits_multi_leg(
         min_entry_threshold=0.01 if is_calendar else 0.0,
     )
 
-    result_indexed.loc[valid_trig.index, "exit_type"] = valid_trig["_exit_type"].values
-    result_indexed.loc[valid_trig.index, "_early_exit_date"] = pd.to_datetime(
-        valid_trig["_exit_quote_date"]
-    ).values
+    _mark_early_exit(
+        result_indexed,
+        valid_trig.index,
+        valid_trig["_exit_type"],
+        valid_trig["_exit_quote_date"],
+    )
 
     return result_indexed.reset_index()
