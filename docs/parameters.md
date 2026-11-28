@@ -318,7 +318,7 @@ quoted option prices.
 ## Slippage Parameters
 
 #### `slippage`
-**Type:** `str` | **Default:** `'mid'`
+**Type:** `str` | **Default:** `'spread'`
 
 Slippage model for fill price calculation.
 
