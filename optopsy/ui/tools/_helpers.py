@@ -81,9 +81,9 @@ def _fetch_single_symbol_stock(
         if cached is None or cached.empty:
             return None
 
+        cached_dates = pd.to_datetime(cached["date"]).dt.date
         result = cached[
-            (pd.to_datetime(cached["date"]).dt.date >= padded_start)
-            & (pd.to_datetime(cached["date"]).dt.date <= date_max)
+            (cached_dates >= padded_start) & (cached_dates <= date_max)
         ].rename(columns={"date": "quote_date"})
         if result.empty:
             return None
@@ -97,6 +97,27 @@ def _fetch_single_symbol_stock(
     except (OSError, ValueError, KeyError, pd.errors.ParserError) as exc:
         _log.warning("yfinance fetch failed for %s: %s", symbol, exc)
         return None
+
+
+def _stock_fetch_window(dataset: pd.DataFrame) -> "tuple[date, date] | None":
+    """Return ``(padded_start, date_max)`` for stock fetches, or None if unusable.
+
+    Pads the options date range by ~1 year so indicators with long warmup
+    periods have enough history.  Returns None when the dataset is empty or
+    yfinance is not installed.
+    """
+    if dataset.empty:
+        return None
+
+    try:
+        import yfinance as yf  # noqa: F401 — validates availability
+    except ImportError:
+        _log.warning("yfinance not installed — cannot fetch stock data for TA signals")
+        return None
+
+    date_min = pd.to_datetime(dataset["quote_date"].min()).date()
+    date_max = pd.to_datetime(dataset["quote_date"].max()).date()
+    return date_min - timedelta(days=365), date_max
 
 
 def _fetch_stock_data_for_signals(dataset: pd.DataFrame) -> pd.DataFrame | None:
@@ -115,19 +136,12 @@ def _fetch_stock_data_for_signals(dataset: pd.DataFrame) -> pd.DataFrame | None:
         underlying_symbol, quote_date, open, high, low, close, volume
     Or None if yfinance is not available or all fetches fail.
     """
-    if dataset.empty:
+    window = _stock_fetch_window(dataset)
+    if window is None:
         return None
-
-    try:
-        import yfinance as yf  # noqa: F401 — validates availability
-    except ImportError:
-        _log.warning("yfinance not installed — cannot fetch stock data for TA signals")
-        return None
+    padded_start, date_max = window
 
     symbols = dataset["underlying_symbol"].unique().tolist()
-    date_min = pd.to_datetime(dataset["quote_date"].min()).date()
-    date_max = pd.to_datetime(dataset["quote_date"].max()).date()
-    padded_start = date_min - timedelta(days=365)
 
     frames = []
     for symbol in symbols:
@@ -149,21 +163,12 @@ def _fetch_stock_data_for_symbol(
     specified symbol instead of the symbols in the options dataset.
     The date range is still derived from the options dataset.
     """
-    if dataset.empty:
+    window = _stock_fetch_window(dataset)
+    if window is None:
         return None
+    padded_start, date_max = window
 
-    try:
-        import yfinance as yf  # noqa: F401 — validates availability
-    except ImportError:
-        _log.warning("yfinance not installed — cannot fetch stock data for TA signals")
-        return None
-
-    symbol = symbol.upper()
-    date_min = pd.to_datetime(dataset["quote_date"].min()).date()
-    date_max = pd.to_datetime(dataset["quote_date"].max()).date()
-    padded_start = date_min - timedelta(days=365)
-
-    return _fetch_single_symbol_stock(symbol, padded_start, date_max)
+    return _fetch_single_symbol_stock(symbol.upper(), padded_start, date_max)
 
 
 def _intersect_with_options_dates(
